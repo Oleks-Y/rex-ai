@@ -61,6 +61,15 @@ export const DEFAULT_SIZE_CAPS: SizeCaps = {
   stepTimeoutMs: 60_000,
 };
 
+export interface StepRecord {
+  /** 1-based index of the step within this run. */
+  index: number;
+  /** Whether this step came from the transcript (resume) or just executed. */
+  source: "fresh" | "resumed";
+  code: string;
+  event: SandboxEvent;
+}
+
 export interface AgentOptions {
   model: LanguageModelV2;
   task: string;
@@ -75,6 +84,18 @@ export interface AgentOptions {
   sizeCaps?: Partial<SizeCaps>;
   /** Root for `.rex/sessions/<id>/`. Defaults to cwd. */
   sessionsRoot?: string;
+  /**
+   * If true, replays `transcript.jsonl` as priorSteps when resuming a
+   * session. Default false (state persists, history doesn't — original
+   * §14a contract).
+   */
+  resumeHistory?: boolean;
+  /**
+   * Called after each step (both replayed-from-transcript and freshly-
+   * executed). Useful for CLI / UI rendering. Awaited if it returns a
+   * promise.
+   */
+  onStep?: (step: StepRecord) => void | Promise<void>;
 }
 
 export type RunResult =

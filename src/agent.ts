@@ -26,7 +26,9 @@ import {
   type AgentOptions,
   DEFAULT_SIZE_CAPS,
   type RunResult,
+  type SandboxEvent,
   type SizeCaps,
+  type StepRecord,
 } from "./types.ts";
 
 export class Agent {
@@ -63,6 +65,24 @@ export class Agent {
     try {
       const priorSteps: PriorStep[] = [];
 
+      // Optional: replay transcript.jsonl as priorSteps. Lets a CLI/UI
+      // continue a conversation: state already comes back from disk
+      // (lib.ts + storage.json); resumeHistory adds the transcript on top.
+      let resumedCount = 0;
+      if (this.#opts.resumeHistory) {
+        const replay = await loadPriorStepsFromTranscript(session);
+        for (const step of replay) {
+          priorSteps.push(step);
+          resumedCount++;
+          await this.#opts.onStep?.({
+            index: resumedCount,
+            source: "resumed",
+            code: step.code,
+            event: step.event,
+          });
+        }
+      }
+
       for (let step = 0; step < this.#maxSteps; step++) {
         const snapshot = await this.#sessionSnapshot(session);
         const prompt = PromptBuilder.build({
@@ -92,9 +112,18 @@ export class Agent {
 
         // Always log the step to the transcript for resume / audit.
         await session.appendTranscript({
-          step: step + 1,
+          step: resumedCount + step + 1,
           code,
           event: { kind: event.kind, ...summarizeEvent(event) },
+        });
+
+        // Notify the caller (CLI / UI) before returning, so it sees the
+        // terminal step too.
+        await this.#opts.onStep?.({
+          index: resumedCount + step + 1,
+          source: "fresh",
+          code,
+          event,
         });
 
         if (event.kind === "reply") {
@@ -130,7 +159,7 @@ export class Agent {
  *  prompt for the *next* step, but persisting them in the JSONL transcript
  *  adds bulk without much resume value. Keep one summary per kind. */
 // deno-lint-ignore no-explicit-any
-function summarizeEvent(ev: import("./types.ts").SandboxEvent): Record<string, any> {
+function summarizeEvent(ev: SandboxEvent): Record<string, any> {
   switch (ev.kind) {
     case "reply":
       return { message: ev.message };
@@ -142,5 +171,43 @@ function summarizeEvent(ev: import("./types.ts").SandboxEvent): Record<string, a
       return { permission: ev.permission, target: ev.target };
     case "throw":
       return { error: ev.error };
+  }
+}
+
+/** Reconstruct PriorStep[] from a session's transcript.jsonl. Logs are not
+ *  persisted to the transcript, so resumed steps come back with empty logs. */
+async function loadPriorStepsFromTranscript(session: SessionStore): Promise<PriorStep[]> {
+  const raw = await session.loadTranscript();
+  const out: PriorStep[] = [];
+  for (const entry of raw) {
+    const code = typeof entry.code === "string" ? entry.code : "";
+    const ev = entry.event as Record<string, unknown> | undefined;
+    if (!code || !ev || typeof ev.kind !== "string") continue;
+    const event = reconstructEvent(ev);
+    if (event) out.push({ code, event });
+  }
+  return out;
+}
+
+function reconstructEvent(ev: Record<string, unknown>): SandboxEvent | null {
+  switch (ev.kind) {
+    case "reply":
+      return { kind: "reply", message: String(ev.message ?? ""), logs: [] };
+    case "abort":
+      return { kind: "abort", error: String(ev.error ?? ""), logs: [] };
+    case "reflect":
+      return { kind: "reflect", state: ev.state, logs: [] };
+    case "permission_denied":
+      return {
+        kind: "permission_denied",
+        permission: (ev.permission ?? "read") as SandboxEvent extends
+          { kind: "permission_denied"; permission: infer P } ? P : never,
+        target: String(ev.target ?? ""),
+        logs: [],
+      };
+    case "throw":
+      return { kind: "throw", error: String(ev.error ?? ""), logs: [] };
+    default:
+      return null;
   }
 }

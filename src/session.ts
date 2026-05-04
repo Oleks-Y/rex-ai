@@ -211,6 +211,30 @@ export class SessionStore {
     await Deno.writeTextFile(this.transcriptPath, line, { append: true });
   }
 
+  /**
+   * Read transcript.jsonl, returning each line as a parsed object.
+   * Malformed lines are skipped (a partial-write race shouldn't blow up
+   * a resume; we'd rather drop one entry than refuse to start).
+   */
+  async loadTranscript(): Promise<Array<Record<string, unknown>>> {
+    let text: string;
+    try {
+      text = await Deno.readTextFile(this.transcriptPath);
+    } catch (e) {
+      if (e instanceof Deno.errors.NotFound) return [];
+      throw e;
+    }
+    const out: Array<Record<string, unknown>> = [];
+    for (const line of text.split("\n")) {
+      if (line.trim() === "") continue;
+      try {
+        const v = JSON.parse(line);
+        if (v && typeof v === "object") out.push(v as Record<string, unknown>);
+      } catch { /* skip malformed line */ }
+    }
+    return out;
+  }
+
   // ── lifecycle ───────────────────────────────────────────────────────────
 
   async close(): Promise<void> {
