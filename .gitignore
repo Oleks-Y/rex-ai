@@ -2,5 +2,8 @@
 node_modules/
 .DS_Store
 *.log
-.claude/scheduled_tasks.lock
+.claude/
 .pi/
+.docs/
+scratch/
+tests/cli/out/
