@@ -35,7 +35,6 @@ const agent = new Agent({
     net: ["api.github.com"],     // Deno --allow-net allowlist
     read: ["./cache"],            // Deno --allow-read allowlist
     write: [],                    // no fs writes
-    env: ["GITHUB_TOKEN"],        // Deno --allow-env allowlist
     run: false,                   // no subprocesses
     modules: ["std/encoding"],    // import allowlist (see §6)
   },
@@ -44,7 +43,9 @@ const agent = new Agent({
 });
 
 const result = await agent.run();
-// → { kind: "reply", message: "..." } | { kind: "abort", error: "..." } | { kind: "exhausted" }
+// → { kind: "reply", message: string }
+//   | { kind: "abort", error: string }
+//   | { kind: "exhausted", steps: number }
 ```
 
 ## 3. Component map
@@ -68,43 +69,58 @@ const result = await agent.run();
 1. step = 0; messages = [systemPrompt(task, tools, control-fns)]
 2. while step < maxSteps:
 3.   completion = generateText({ model, messages })
-4.   code = CodeExtractor.extract(completion.text)
+4.   code = CodeExtractor.extract(completion.text)        // throws on missing fence
 5.   event = await Sandbox.run(code, prelude, permissions)
 6.   switch event.kind:
-7.     case "reply":   return { kind: "reply", message: event.message }
-8.     case "abort":   return { kind: "abort", error: event.error }
+7.     case "reply":             return { kind: "reply",  message: event.message }
+8.     case "abort":             return { kind: "abort",  error: event.error }
 9.     case "reflect":
-10.      messages.push(assistantTurn(code), reflectionTurn(event.state, event.stdout, event.stderr))
+10.      messages.push(assistantTurn(code), reflectionTurn(event.state, event.logs))
 11.      step++
-12.    case "throw":   // uncaught exception in sandbox
-13.      messages.push(assistantTurn(code), errorTurn(event.error))
+12.    case "permission_denied":  // Deno.errors.PermissionDenied caught by prelude
+13.      messages.push(assistantTurn(code), permissionDeniedTurn(event))
 14.      step++
-15. return { kind: "exhausted" }
+15.    case "throw":              // any other uncaught exception in sandbox
+16.      messages.push(assistantTurn(code), errorTurn(event.error, event.logs))
+17.      step++
+18. return { kind: "exhausted", steps: step }
 ```
 
-Key invariant: the sandbox **must** terminate via one of the three control fns. Any other exit (uncaught throw, OOM, permission denial from Deno itself) is fed back to the LLM as a "throw" event so it can self-correct.
+Key invariant: the sandbox **must** terminate via one of the three control fns. Any other exit gets categorized:
+- `Deno.errors.PermissionDenied` → `permission_denied` event (structured: which permission, which target).
+- All other uncaught throws → `throw` event.
+- Process killed (timeout, OOM, exit code != 0 with no control message) → `throw` event with a synthetic error message.
+
+In every non-terminal case the LLM gets a chance to self-correct on the next step.
 
 ## 5. Sandbox protocol (parent ↔ child)
 
-Two message directions:
+**Single channel**: stdin/stdout carry framed JSON RPC, nothing else. Real stdout passthrough is gone — `console.{log,warn,error}` are overridden in the prelude to emit `log` events. The parent reconstructs a per-step `logs[]` array from these events.
 
-**Child → Parent** (control + tool calls):
+Framing: each frame is `length\n` (decimal byte count) followed by the JSON payload. Robust to partial reads.
+
+**Child → Parent**:
 ```json
 { "type": "reply",  "message": "..." }
 { "type": "abort",  "error": "..." }
-{ "type": "reflect","state": {...} }
+{ "type": "reflect","state": <json> }
 { "type": "tool_call", "id": "u1", "name": "fetchIssues", "args": {...} }
+{ "type": "log", "level": "info"|"warn"|"error", "args": [...] }
+{ "type": "permission_denied", "permission": "net"|"read"|"write"|..., "target": "..." }
+{ "type": "storage_get" | "storage_set" | "storage_del" | "storage_keys", "id": "...", ... }
+{ "type": "write_lib", "id": "...", "source": "..." }
 ```
 
-**Parent → Child** (tool results only):
+**Parent → Child** (responses to the request-style messages above):
 ```json
-{ "type": "tool_result", "id": "u1", "ok": true,  "value": ... }
-{ "type": "tool_result", "id": "u1", "ok": false, "error": "..." }
+{ "type": "tool_result",    "id": "u1", "ok": true,  "value": ... }
+{ "type": "tool_result",    "id": "u1", "ok": false, "error": "..." }
+{ "type": "storage_result", "id": "...", "ok": true, "value": ... }
+{ "type": "write_lib_result","id": "...", "ok": true }
+{ "type": "write_lib_result","id": "...", "ok": false, "error": "..." }
 ```
 
-Framing: `length\n` + JSON line, on a dedicated FD (Deno supports extra pipes via `Deno.Command` `stdout: "piped"`; for RPC we'll use stdin/stdout and reserve real stdout for `console.log` capture in the transcript).
-
-Recommended split: **stdin/stdout = RPC**, the LLM's `console.log` is captured by overriding `console` in the prelude to forward to a separate "log" RPC message. Cleaner than fighting stdout.
+JSON serialization rules (host and sandbox both): values are passed through `JSON.stringify`. `undefined` becomes "missing key"; `Date` becomes ISO string (caller's responsibility); `BigInt` and `Function` are rejected with a clear error. Tool authors are expected to return JSON-safe values.
 
 ## 6. Module / library restriction
 
@@ -140,13 +156,14 @@ Recommendation for MVP: **B**. Keep it simple, observable, debuggable. Add summa
 | Config key | Deno flag |
 |---|---|
 | `permissions.net: string[]` | `--allow-net=host1,host2` (omit flag → no net) |
-| `permissions.read: string[]` | `--allow-read=path1,path2` |
+| `permissions.read: string[]` | `--allow-read=path1,path2` (auto-includes `.rex/sessions/<id>` for `session:lib`) |
 | `permissions.write: string[]` | `--allow-write=path1,path2` |
-| `permissions.env: string[]` | `--allow-env=VAR1,VAR2` |
 | `permissions.run: boolean` | `--allow-run` (boolean, MVP doesn't allowlist binaries) |
 | `permissions.modules: string[]` | import map + AST scan (see §6) |
 
 Default: deny everything. User opts in per category.
+
+`env` is **out of MVP**: tools execute in the parent process, so the sandbox rarely needs `Deno.env`. Dropping it shrinks the trust surface. Easy to add later if a use case appears.
 
 ## 10. Code extraction strategy
 
@@ -156,6 +173,8 @@ LLM output options:
 - **C. Both, with fallback**: try structured first, fall back to markdown.
 
 Recommendation: **A** for MVP. Markdown is universal; structured can be added later as an optimization.
+
+**Fence leniency:** accept ` ```ts ` and ` ```typescript `. Reject everything else — no fence, wrong language tag, or no code block at all → throw a clear `NoCodeBlockError`. Surfacing this back to the LLM as a step error is post-MVP; for now it's a hard fail of `agent.run()`.
 
 ## 11. Prelude (injected into every sandbox)
 
@@ -172,16 +191,47 @@ async function abort(error: string): Promise<never> {
   Deno.exit(0);
 }
 async function reflect(state: unknown): Promise<never> {
+  // size-cap enforced parent-side; rejected reflects come back as a tool-style error
   await __rpc.send({ type: "reflect", state });
   Deno.exit(0);
 }
-// One stub per registered tool:
-async function fetchIssues(args: {...}): Promise<...> {
-  return __rpc.call("tool_call", { name: "fetchIssues", args });
+async function writeLib(source: string): Promise<void> {
+  const r = await __rpc.call("write_lib", { source });
+  if (!r.ok) throw new WriteLibError(r.error);
 }
-// Replace console.log with RPC-forwarded variant
-console.log = (...a) => __rpc.send({ type: "log", level: "info", args: a });
-// LLM-generated code appended below
+const storage = {
+  get:  (k: string) => __rpc.call("storage_get",  { key: k }).then(unwrap),
+  set:  (k: string, v: unknown) => __rpc.call("storage_set",  { key: k, value: v }).then(unwrap),
+  del:  (k: string) => __rpc.call("storage_del",  { key: k }).then(unwrap),
+  keys: ()          => __rpc.call("storage_keys", {}).then(unwrap),
+};
+// One stub per registered tool — args validated parent-side with zod:
+async function fetchIssues(args: {...}): Promise<...> {
+  const r = await __rpc.call("tool_call", { name: "fetchIssues", args });
+  if (!r.ok) throw new ToolError(r.error);   // includes zod issues if validation failed
+  return r.value;
+}
+// Forward all console levels through RPC; no real stdout passthrough.
+for (const level of ["log","info","warn","error","debug"] as const) {
+  console[level] = (...a) => __rpc.sendNoWait({ type: "log", level, args: a });
+}
+// Catch PermissionDenied from the LLM body and surface it as a typed event.
+try {
+  // LLM-generated code appended below, wrapped in an async IIFE
+  await (async () => {
+    /* <<<LLM CODE>>> */
+  })();
+  // If we get here, the LLM forgot to call a control function.
+  await __rpc.send({ type: "abort", error: "agent code returned without calling reply/abort/reflect" });
+  Deno.exit(0);
+} catch (e) {
+  if (e instanceof Deno.errors.PermissionDenied) {
+    await __rpc.send({ type: "permission_denied", permission: classify(e), target: extractTarget(e) });
+  } else {
+    await __rpc.send({ type: "throw", error: String(e?.stack ?? e) });
+  }
+  Deno.exit(0);
+}
 ```
 
 ## 12. System prompt skeleton
@@ -195,6 +245,9 @@ You have three control functions; your code MUST exit through exactly one of the
 - abort(error: string)    — refuse or fail because of missing capability/permission
 - reflect(state: unknown) — pause and request another generation step with state
 
+Calling a tool with arguments that fail validation throws a ToolError with the
+specific zod issues. Catch and recover, or call abort() if unrecoverable.
+
 Permissions granted to your sandbox:
 - network: api.github.com
 - file read: ./cache
@@ -202,6 +255,8 @@ Permissions granted to your sandbox:
 - modules:  std/encoding
 
 If you need a capability not listed above, call abort() with a clear explanation.
+A disallowed fetch / read / write will surface as a permission_denied event on
+the next step rather than a thrown exception you can catch.
 
 Tools available (callable as async functions):
 - fetchIssues(args: { repo: string; limit?: number }): Promise<Issue[]>
@@ -209,22 +264,28 @@ Tools available (callable as async functions):
 
 Task: <user task>
 
-Prior steps: <transcript of prior code + stdout + state, if any>
+Prior steps: <transcript of prior code + logs + state + errors, if any>
 ```
 
+Tool signatures are rendered from each tool's zod schema via `zod-to-ts` (chosen for the small subset MVP needs: object / string / number / boolean / array / optional / enum / union of literals). Tool author is the source of truth — if the rendered TS doesn't match what they want the LLM to see, they can override with an explicit `tsSignature` field on the tool definition.
+
 ## 13. MVP scope (what's IN, what's OUT)
+
+**Day-0 gate (before any other code):** smoke-test Vercel AI SDK on Deno — minimal `npm:ai` import + one `generateText` call. If it doesn't work cleanly, that gets resolved before scaffolding starts.
 
 **IN:**
 1. `Agent` class with `.run()` returning a discriminated union result.
 2. Vercel AI SDK integration (`generateText`).
-3. Markdown code-block extraction.
+3. Markdown code-block extraction (accepts `ts` and `typescript`; hard-fails otherwise).
 4. Deno subprocess sandbox with permission compilation.
-5. Three control functions (`reply`, `abort`, `reflect`).
-6. Tool RPC (parent-side execution, zod schema validation).
-7. Module allowlist via import map + AST scan.
-8. Per-step transcript replay (option B from §8).
-9. `maxSteps` cap with `exhausted` result.
-10. Tests: unit (extractor, prompt, perm-compiler) + integration (real Deno subprocess, mock LLM).
+5. Three control functions (`reply`, `abort`, `reflect`) + reserved-name enforcement.
+6. Tool RPC (parent-side execution, zod schema validation, `ToolError` on failure).
+7. Module allowlist via import map + AST scan, regenerated per step.
+8. Per-step transcript replay (option B from §8) with size caps (§17).
+9. `writeLib` + `storage` + session bootstrap + `.lock` concurrency guard.
+10. Structured `permission_denied` event (separate from `throw`).
+11. `maxSteps` cap with `exhausted` result.
+12. Tests: unit (extractor, prompt, perm-compiler, module-guard, RPC framing) + integration (real Deno subprocess, mock LLM).
 
 **OUT (post-MVP):**
 - Persistent sandbox process (each step spawns fresh).
@@ -240,9 +301,17 @@ Prior steps: <transcript of prior code + stdout + state, if any>
 1. ✅ Tool execution location — **Parent-RPC** (§7).
 2. ✅ Module whitelisting — **Import map + AST scan** (§6).
 3. ✅ State across reflect — **Full transcript** for MVP (§8).
-4. ✅ Sandbox lifecycle — **Spawn-per-step + persistent per-session workspace** (see §14a).
-5. ✅ Code extraction — **Markdown fenced ts block** (§10).
-6. ✅ Imports in generated code — **Allowed, restricted to module allowlist + session lib**.
+4. ✅ Sandbox lifecycle — **Spawn-per-step + persistent per-session workspace** (§14a).
+5. ✅ Code extraction — **Markdown fenced ts/typescript block; hard-fail on missing fence** (§10).
+6. ✅ Imports in generated code — **Allowed, restricted to module allowlist + session:lib**.
+7. ✅ RPC channel — **stdin/stdout only; console redirected via RPC log events** (§5, §11).
+8. ✅ Permission-denied surfacing — **structured `permission_denied` event** (§4, §11).
+9. ✅ `env` permission — **dropped from MVP** (§9).
+10. ✅ Reserved tool names — **`reply` / `abort` / `reflect` / `writeLib` / `storage` / `console`** (§17).
+11. ✅ Tool signature rendering — **`zod-to-ts` with optional `tsSignature` override** (§12).
+12. ✅ Tool arg validation failure — **stub throws `ToolError` carrying zod issues** (§11, §12).
+13. ✅ Size caps — **defaults in §17, all configurable on `Agent`**.
+14. ✅ Session resume / concurrency — **state inherits, history doesn't; `.lock` file enforces single writer** (§14a).
 
 ## 14a. Session persistence model (resolves Issue 4)
 
@@ -280,20 +349,28 @@ Backed by `storage.json` on the host side, accessed only via RPC — sandbox nev
 
 ### c) Importing the session lib
 
-The import map auto-injects:
+A per-session import map lives at `.rex/sessions/<id>/import_map.json` and is **regenerated at the start of every step** (the user's allowlist may change between calls). The parent passes it via `--import-map=<path>`. It contains the user's allowed module mappings plus:
 ```json
-{ "imports": { "session:lib": "./.rex/sessions/<id>/lib.ts" } }
+{ "imports": { "session:lib": "./lib.ts" } }
 ```
 
-Permission flags: `--allow-read=.rex/sessions/<id>` so imports resolve. Writes to `lib.ts` go through RPC, **not** through `--allow-write` in the sandbox — the agent never has direct fs write to its own lib (parent mediates and validates).
+Permission flags: `.rex/sessions/<id>` is auto-added to `--allow-read` so imports resolve. Writes to `lib.ts` go through RPC, **not** through `--allow-write` in the sandbox — the agent never has direct fs write to its own lib (parent mediates and validates).
+
+**Bootstrapping**: `SessionStore.init()` (called by `Agent` before step 1) creates `.rex/sessions/<id>/lib.ts` with `export {};` if it doesn't exist, plus an empty `storage.json` and `transcript.jsonl`. This guarantees `import { ... } from "session:lib"` resolves cleanly even on a brand-new session.
+
+### Resume + concurrency contract
+
+- **Resume**: calling `new Agent({ sessionId: "X", task: ... }).run()` with an existing `sessionId` inherits `lib.ts` + `storage.json` from disk. The in-memory `messages` array starts fresh (does **not** replay `transcript.jsonl` into the prompt). Independent runs share **state**, not **history**.
+- **Concurrency**: a `.lock` file in the session directory is taken when `run()` starts and released on exit. A second concurrent run with the same `sessionId` is rejected with `SessionLockedError`. Stale locks are cleared if the holder PID is gone.
+- **Sessionless mode**: omitting `sessionId` auto-generates an ephemeral one and deletes the workspace on `run()` exit (so you can use the library without thinking about persistence).
 
 ### Why this shape
 
 - Spawn-per-step survives — still simple, still isolated, no in-process state-reset bug surface.
-- Pinning gives the "long-lived feel" without the long-lived process: useful helpers compound across steps.
-- Parent-mediated writes mean we can AST-validate every pin and refuse pins that try to escape the allowlist.
+- Agent-authored helpers give the "long-lived feel" without a long-lived process: useful helpers compound across steps.
+- Parent-mediated writes mean we can AST-validate every `writeLib` and refuse code that tries to escape the allowlist.
 - Storage is structured (JSON), separate from code (lib.ts), separate from history (transcript.jsonl) — three clean concerns.
-- Trivially resumable: a session can be re-opened by `sessionId` and the agent picks up its pinned lib + storage.
+- Trivially resumable: a session can be re-opened by `sessionId` and the agent picks up its helpers + storage.
 
 ### Prompt addition (§12 extension)
 
@@ -358,19 +435,37 @@ rex-ai/
 
 ## 16. Test strategy (pre-write so we don't shortchange it)
 
-- **Extractor**: many fixtures (no fence, multiple fences, nested fences, no language tag, prose around it).
-- **PromptBuilder**: golden file tests (snapshot the rendered prompt).
-- **PermissionCompiler**: table-driven (config → expected flags).
-- **ModuleGuard**: positive and negative cases for static + dynamic imports, allowed and disallowed.
-- **RPC**: round-trip framing, malformed input, partial reads.
-- **Sandbox integration**: spawn real Deno, run code that calls each control fn + each tool path + a deliberate throw + a permission-denied fetch.
-- **Agent integration**: in-process `MockModel` that returns a scripted sequence of code blocks; verify reply/abort/reflect/throw/exhausted flows end to end.
+- **Extractor**: ts fence, typescript fence, multiple fences (last wins), nested fences, no fence (hard fail), wrong language tag (hard fail), prose around block.
+- **PromptBuilder**: golden file tests (snapshot the rendered prompt for: no tools, multiple tools, with prior steps, with current lib.ts, with storage keys).
+- **PermissionCompiler**: table-driven (config → expected flags + import-map content).
+- **ModuleGuard**: static + dynamic imports, allowed + disallowed, also for `writeLib` source.
+- **RPC**: round-trip framing, malformed input, partial reads, oversize frame rejection.
+- **Reserved-name guard**: `Agent` rejects a tool named `reply` / `abort` / `reflect` / `writeLib` / `storage` / `console`.
+- **Sandbox integration**: spawn real Deno, run code that calls each control fn + each tool path + a deliberate throw + a permission-denied fetch (verify `permission_denied` event) + a non-control-fn return (verify auto-abort) + per-step timeout.
+- **Size caps**: logs over 64 KB truncate; reflect over 256 KB rejected; tool result over 256 KB throws `ToolResultTooLargeError`; writeLib over 64 KB rejected; storage quota.
+- **Session lifecycle**: bootstrap creates `lib.ts` / `storage.json` / `transcript.jsonl`; resume inherits state; sessionless mode cleans up; `.lock` blocks concurrent runs and clears stale locks.
+- **writeLib**: writes a real `.ts` file; disallowed import in source → rejected, file unchanged; rewrite is full-replace.
+- **Cross-session isolation**: two sessions writing the same export name don't collide.
+- **Agent integration**: in-process `MockModel` that returns a scripted sequence of code blocks; verify reply / abort / reflect / permission_denied / throw / exhausted flows end to end.
 
-## 17. Risks / sharp edges
+## 17. Risks / sharp edges + size caps
 
-- **Stdout collision**: LLM code calling `console.log` corrupts RPC framing if we use stdout. Mitigation: dedicated pipe, or override `console` in prelude.
-- **Async never-returning control fns**: `reply/abort/reflect` must be marked `Promise<never>` and end in `Deno.exit`. If the LLM forgets to `await` them, code may continue running. Consider also wrapping the LLM code in a top-level async fn that fails if it returns without a control-fn call.
-- **Hung sandbox**: a code path that awaits forever. Need a per-step wall-clock timeout.
-- **Large state in `reflect`**: if state is multi-megabyte JSON, token budget explodes. Consider a soft size limit with a warning passed back to the LLM.
-- **AST parser cost**: parsing every step's code adds latency. Recommend `@typescript-eslint/typescript-estree` or `swc` via wasm; benchmark before final pick.
-- **Vercel AI SDK on Deno**: the SDK is published for Node; we need to verify Deno compatibility (npm: specifiers in Deno generally work but worth a smoke test on day 1).
+**Size caps (defaults; configurable on `Agent`):**
+
+| Limit | Default | On exceed |
+|---|---|---|
+| Logs per step (total bytes) | 64 KB | Truncate, append `…[truncated]` marker, surface to LLM |
+| `reflect` state JSON | 256 KB | Reject the reflect; feed back `state too large` error |
+| Single tool result JSON | 256 KB | Reject; tool stub throws `ToolResultTooLargeError` |
+| `lib.ts` source | 64 KB | `writeLib` rejects; surfaces as `WriteLibError` |
+| `storage.json` total | 1 MB | `storage.set` rejects with quota error |
+| Per-step wall-clock | 60 s | Kill sandbox; emit `throw` event with timeout reason |
+
+**Other sharp edges:**
+
+- **RPC framing integrity**: with stdin/stdout being the only channel, any direct `Deno.stdout.write` from LLM code would corrupt frames. Mitigation: prelude redirects `console.*`; we also document that direct `Deno.stdout` writes are unsupported (and should be caught by the AST guard if we want extra safety post-MVP).
+- **Async never-returning control fns**: `reply/abort/reflect` are `Promise<never>` and end in `Deno.exit`. The prelude wraps the LLM body so that if execution returns without calling one of them, the parent gets a synthesized `abort` event. No silent hangs from forgotten `await`s.
+- **AST parser pick**: TBD between `@typescript-eslint/typescript-estree` and `swc` wasm. Benchmark before final pick; not a plan blocker.
+- **Vercel AI SDK on Deno**: covered by the day-0 gate in §13.
+- **Reserved tool names**: `reply`, `abort`, `reflect`, `writeLib`, `storage`, `console` are reserved. `Agent` constructor rejects user tools that collide.
+- **Disk growth on long-lived sessions**: out of MVP, but `pruneSession(id)` and `listSessions()` utilities are noted for v0.2.
