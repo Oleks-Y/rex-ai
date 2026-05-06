@@ -1,45 +1,49 @@
 # rex-ai
 
-> **Status: experimental MVP (v0.1).** APIs will change. Built as a research
-> exercise in code-action agents on Deno; not production-hardened.
+> **Status: experimental MVP (v0.1).** APIs will change. Built as a research exercise in code-action
+> agents on Deno; not production-hardened.
 
-A small TypeScript library for building **code-action agents** — agents
-where the LLM writes a TypeScript snippet each step and that snippet runs
-inside a permission-restricted Deno subprocess. Inspired by
-[smolagents](https://github.com/huggingface/smolagents); built on the
+A small TypeScript library for building **code-action agents** — agents where the LLM writes a
+TypeScript snippet each step and that snippet runs inside a permission-restricted Deno subprocess.
+Inspired by [smolagents](https://github.com/huggingface/smolagents); built on the
 [Vercel AI SDK](https://sdk.vercel.ai/) and Deno's native sandbox.
 
 ## Why code-action?
 
-Most agents return a structured tool call per step. A code-action agent
-returns a *script*, so one LLM call can chain operations, branch, loop,
-parse, transform — without round-tripping per tool. Cheaper, more
-expressive, fewer tokens. The cost is that you have to run untrusted
-code, which is exactly what Deno's permission flags are for.
+Most agents return a structured tool call per step. A code-action agent returns a _script_, so one
+LLM call can chain operations, branch, loop, parse, transform — without round-tripping per tool.
+Cheaper, more expressive, fewer tokens. The cost is that you have to run untrusted code, which is
+exactly what Deno's permission flags are for.
 
 ## What you get
 
 - An `Agent` class that loops `generate → extract code → run in sandbox →
-  observe → repeat` until the script `return`s `reply()`, `abort()`, or
-  you hit `maxSteps`.
-- A Deno subprocess sandbox with **deny-by-default** permissions that
-  you opt into per agent (`net`, `read`, `write`, `run`, `modules`).
-- **Parent-side tools** defined with zod schemas — the sandbox calls
-  them via RPC, so the LLM-generated code stays unprivileged while your
-  tool handlers can do whatever they need.
-- **Per-session workspace** at `.rex/sessions/<id>/`: an
-  agent-authored `lib.ts` (helpers it can extend across steps), a
-  KV `storage` API, and a transcript log.
-- An AST module-allowlist (defense-in-depth on top of import maps) so
-  the LLM can only import what you've allowed.
-- A small CLI runner (`src/cli.ts`) that loads an agent factory file
-  and prints each step.
+  observe → repeat` until
+  the script `return`s `reply()`, `abort()`, or you hit `maxSteps`.
+- A Deno subprocess sandbox with **deny-by-default** permissions that you opt into per agent (`net`,
+  `read`, `write`, `run`, `modules`).
+- **Parent-side tools** defined with zod schemas — the sandbox calls them via RPC, so the
+  LLM-generated code stays unprivileged while your tool handlers can do whatever they need.
+- **Per-session workspace** at `.rex/sessions/<id>/`: an agent-authored `lib.ts` (helpers it can
+  extend across steps), a KV `storage` API, and a transcript log.
+- An AST module-allowlist (defense-in-depth on top of import maps) so the LLM can only import what
+  you've allowed.
+- A small CLI runner (`src/cli.ts`) that loads an agent factory file, with **one-shot** and
+  **interactive** (`-i`) modes.
+- **Experimental async-wakeup mode** (`experimental.asyncWakeups: true`) — opens a long-lived
+  `AgentSession`, runs the LLM's code inside a _persistent_ Deno subprocess so promises and
+  `globalThis` state survive across steps, and lets the model `scheduleWakeup(...)` to re-enter a
+  turn when an awaited piece of work resolves. See
+  [`docs/plans/async-wakeup-mode.md`](docs/plans/async-wakeup-mode.md).
+- A reproducible **evaluation suite** (`evals/`) with golden YAML cases, BFCL function-calling,
+  multiple grader types (exact / numeric / JSON / regex / LLM-judge), and a regression gate. See
+  [`evals/README.md`](evals/README.md).
 
 ## Requirements
 
 - [Deno](https://deno.com/) 1.45+ (uses `npm:` and `jsr:` specifiers).
-- An API key for whichever model you wire up (the examples use
-  `npm:@ai-sdk/openai`, so `OPENAI_API_KEY`).
+- An API key for whichever model you wire up (the examples use `npm:@ai-sdk/openai`, so
+  `OPENAI_API_KEY`).
 
 ## Quick start
 
@@ -90,10 +94,9 @@ OPENAI_API_KEY=... deno run \
   my_agent.ts
 ```
 
-The *parent* needs broad Deno permissions because it spawns subprocesses
-and runs your tool handlers. The *sandboxed agent code* only gets what
-you list in `permissions` — in this example, network access to
-`api.github.com` and nothing else.
+The _parent_ needs broad Deno permissions because it spawns subprocesses and runs your tool
+handlers. The _sandboxed agent code_ only gets what you list in `permissions` — in this example,
+network access to `api.github.com` and nothing else.
 
 ## CLI
 
@@ -106,9 +109,8 @@ OPENAI_API_KEY=... deno run -A src/cli.ts \
   -- "Send an email to alice@example.com saying hi."
 ```
 
-Reusing `--session <id>` continues the same workspace (the agent's
-`lib.ts`, `storage`, and transcript persist under `.rex/sessions/<id>/`).
-The `--agent` file must default-export a factory:
+Reusing `--session <id>` continues the same workspace (the agent's `lib.ts`, `storage`, and
+transcript persist under `.rex/sessions/<id>/`). The `--agent` file must default-export a factory:
 
 ```ts
 // my_factory.ts
@@ -122,6 +124,8 @@ export default function createAgent(input: AgentFactoryInput): Agent {
     sessionId: input.sessionId,
     onStep: input.onStep,
     resumeHistory: input.resumeHistory,
+    // Forward when the CLI runs in interactive mode:
+    experimental: { asyncWakeups: input.asyncWakeups },
     tools: [/* ... */],
     permissions: { /* ... */ },
   });
@@ -130,91 +134,159 @@ export default function createAgent(input: AgentFactoryInput): Agent {
 
 See `examples/` for working factories.
 
+### Interactive mode (`-i`)
+
+```sh
+OPENAI_API_KEY=... deno run -A src/cli.ts --interactive \
+  --agent examples/random_number.ts \
+  --session chat \
+  -- "Pick a number between 1 and 100."
+```
+
+This opens an `AgentSession`: the CLI streams `AgentEvent`s, reads stdin lines as user messages
+between turns, and stays alive until `/exit` or EOF. The agent can `scheduleWakeup(...)` to re-enter
+a turn later (e.g. when a long-running tool resolves) without blocking the user. Interactive mode
+requires the factory to forward async-wakeups to the `Agent`; the CLI sets `asyncWakeups: true` on
+`AgentFactoryInput`.
+
 ## Examples
 
-| File | What it shows |
-|---|---|
-| [`examples/random_number.ts`](examples/random_number.ts) | Minimal agent, zero tools, zero permissions. |
-| [`examples/github_issues.ts`](examples/github_issues.ts) | Tool with a zod schema + scoped network permission. |
-| [`examples/email.ts`](examples/email.ts) | "Tools = privilege" pattern: zero sandbox permissions, all I/O through a parent-side tool. |
+| File                                                     | What it shows                                                                              |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| [`examples/random_number.ts`](examples/random_number.ts) | Minimal agent, zero tools, zero permissions.                                               |
+| [`examples/github_issues.ts`](examples/github_issues.ts) | Tool with a zod schema + scoped network permission.                                        |
+| [`examples/email.ts`](examples/email.ts)                 | "Tools = privilege" pattern: zero sandbox permissions, all I/O through a parent-side tool. |
 
 ## The control contract (what the LLM writes)
 
-Each step the model emits a single ` ```ts ` block whose top-level
-**returns** one of three control values:
+Each step the model emits a single `` ```ts `` block whose top-level **returns** one of three
+control values:
 
 ```ts
 return reply("the answer to the user");
 return abort("missing capability X — please grant ...");
-return reflect({ /* state to carry into the next step */ });
+return reflect({/* state to carry into the next step */});
 ```
 
-`reply` / `abort` / `reflect` are synchronous value constructors. The
-sandbox waits for the body to fully resolve, drains any in-flight tool
-calls and log writes, then dispatches the terminal frame to the parent.
-This is the safe ordering: a `sendEmail` tool call kicked off without
-`await` still finishes before the run ends.
+`reply` / `abort` / `reflect` are synchronous value constructors. The sandbox waits for the body to
+fully resolve, drains any in-flight tool calls and log writes, then dispatches the terminal frame to
+the parent. This is the safe ordering: a `sendEmail` tool call kicked off without `await` still
+finishes before the run ends.
 
-Calling them without `return` also works (the most-recent call wins),
-but `return` is the canonical pattern.
+Calling them without `return` also works (the most-recent call wins), but `return` is the canonical
+pattern.
+
+With `experimental.asyncWakeups: true`, the model can also schedule itself a future turn:
+
+```ts
+const handle = scheduleWakeup(async () => {
+  return await someLongRunningToolCall();
+}, { name: "fetch-results" });
+
+// Or a fire-and-forget delay:
+scheduleWakeup.delay(60_000, { name: "poll-status" });
+
+// Inspect / cancel from a later step:
+tasks.list(); // all live handles
+tasks.pending(); // only unresolved
+tasks.cancel(id);
+```
+
+When a wakeup resolves, the agent loop re-enters with the result surfaced as a synthetic prior step
+(`__wakeup` state) so the model can continue the conversation — typically by sending a follow-up
+`reply()` to the user.
 
 ## Security model in one paragraph
 
-The Deno subprocess running the LLM's code is started with **only** the
-flags compiled from your `permissions` config (everything denied by
-default). Tools run in the *parent* process via RPC over stdin/stdout, so
-they can do privileged things the sandbox can't. A static AST scan
-rejects imports outside your `modules` allowlist before each step. The
-sandbox's `console.*` is redirected through RPC frames; raw
-`Deno.stdout` writes from generated code would corrupt the channel and
-are unsupported. Per-step wall-clock and per-payload size caps protect
-against runaway steps; defaults are in `src/types.ts` (`DEFAULT_SIZE_CAPS`).
+The Deno subprocess running the LLM's code is started with **only** the flags compiled from your
+`permissions` config (everything denied by default). Tools run in the _parent_ process via RPC over
+stdin/stdout, so they can do privileged things the sandbox can't. A static AST scan rejects imports
+outside your `modules` allowlist before each step. The sandbox's `console.*` is redirected through
+RPC frames; raw `Deno.stdout` writes from generated code would corrupt the channel and are
+unsupported. Per-step wall-clock and per-payload size caps protect against runaway steps; defaults
+are in `src/types.ts` (`DEFAULT_SIZE_CAPS`).
 
-This is an MVP. Don't expose it to untrusted task input on a host you
-care about without a hardening pass.
+This is an MVP. Don't expose it to untrusted task input on a host you care about without a hardening
+pass.
 
 ## Project layout
 
-```
+````
 src/
-  agent.ts          # Loop: generate → extract → sandbox → observe → repeat
-  prompt.ts         # System-prompt builder
-  extractor.ts      # Pulls ```ts code blocks from model output
-  sandbox.ts        # Spawns the Deno subprocess
-  prelude.ts        # Code injected into every sandbox (reply/abort/reflect/RPC stubs)
-  rpc.ts            # Length-prefixed JSON framing
-  tools.ts          # Tool registry + zod glue
-  permissions.ts    # Config → Deno CLI flags + import map
-  module_guard.ts   # AST scan for the import allowlist
-  session.ts        # .rex/sessions/<id>/ workspace (lib.ts + storage + transcript)
-  zod_to_ts.ts      # Renders tool signatures for the prompt
-  cli.ts            # The `rex` runner
-  types.ts          # Shared discriminated unions
+  agent.ts             # Loop: generate → extract → sandbox → observe → repeat
+  agent_session.ts     # Long-lived duplex session for interactive / wakeup mode
+  prompt.ts            # System-prompt builder (teaches the wakeup contract too)
+  extractor.ts         # Pulls ```ts code blocks from model output
+  sandbox.ts           # Spawns a fresh Deno subprocess per step (default mode)
+  persistent_sandbox.ts# One subprocess per AgentSession; state survives across steps
+  prelude.ts           # Injected into per-step sandboxes (reply/abort/reflect/RPC stubs)
+  prelude_v2.ts        # Persistent-sandbox prelude: adds scheduleWakeup + tasks API
+  rpc.ts               # Length-prefixed JSON framing
+  tools.ts             # Tool registry + zod glue (rejects names starting with "__")
+  permissions.ts       # Config → Deno CLI flags + import map
+  module_guard.ts      # AST scan for the import allowlist
+  session.ts           # .rex/sessions/<id>/ workspace (lib.ts + storage + transcript)
+  zod_to_ts.ts         # Renders tool signatures for the prompt
+  cli.ts               # The `rex` runner (one-shot + --interactive)
+  types.ts             # Shared discriminated unions (AgentEvent, UserMessage, …)
 examples/
+evals/                 # Reproducible eval suite — see evals/README.md
 tests/
-  unit/             # extractor, prompt, permissions, module guard, rpc, session, tools
-  integration/      # real Deno subprocess + scripted mock model
-```
+  unit/                # extractor, prompt, permissions, module guard, rpc, session,
+                       # tools, async_queue, cli arg parsing
+  integration/         # real Deno subprocess + scripted mock model;
+                       # persistent_sandbox, agent_session, scheduleWakeup
+````
 
 ## Running the tests
 
 ```sh
 deno task test           # full suite (needs broad permissions to spawn subprocesses)
-deno task test:unit      # unit only
+deno task test:unit      # unit only (incl. evals/tests/unit/)
 deno task test:integration
 deno task lint
 deno task fmt
-deno task check
+deno task check          # type-checks src/, tests/, evals/
 ```
+
+CI (`.github/workflows/test.yml`) runs `check` + `test:unit` + `test:integration` on every push and
+PR to master.
+
+## Evaluations
+
+A reproducible regression harness lives in `evals/`:
+
+```sh
+# L1 — golden YAML cases (math, control flow, HumanEval-easy, SimpleQA, GAIA, …)
+OPENAI_API_KEY=... deno task eval:l1 --models gpt-5-nano
+
+# L1 smoke — one task, one model
+OPENAI_API_KEY=... deno task eval:l1 --file evals/golden/rex_specific.yaml --limit 1
+
+# L2 — Berkeley Function-Calling Leaderboard (BFCL v4)
+OPENAI_API_KEY=... deno task eval:l2 --models gpt-5-nano --benchmarks simple,parallel
+
+# Re-score an existing run
+deno task eval:score evals/runs/<id>/results.jsonl
+```
+
+Each invocation writes `evals/runs/<timestamp>_<id>/results.jsonl` and a markdown report.
+`.github/workflows/evals-nightly.yml` runs L1 + L2 nightly with a regression gate
+(`evals/regression_gate.ts`) that fails if accuracy drops more than 10pp vs the recorded baseline.
+PRs do **not** trigger eval runs — they cost real money. See [`evals/README.md`](evals/README.md)
+for graders, agent factories, the budget flag, and how to add cases.
 
 ## Roadmap-ish (post-MVP)
 
-Things explicitly out of scope today: streaming model output,
-agent-as-tool composition, retries / backoff, token-cost accounting,
-RAG, memory, persistent sandbox process, Python tools, WASM, FFI.
+Things explicitly out of scope today: streaming model output, agent-as-tool composition, retries /
+backoff, token-cost accounting, RAG, memory, Python tools, WASM, FFI.
 
-PRs and issues welcome — but heads up that the API surface is still
-moving.
+Async-wakeup mode covers steps 1–4 of
+[`docs/plans/async-wakeup-mode.md`](docs/plans/async-wakeup-mode.md). Steps 5–9 (signal kind +
+`session.signal()`, soft-cancel + memory poll, tier-3 SIGKILL+respawn+replay, fully interruptible
+mode) are follow-ups.
+
+PRs and issues welcome — but heads up that the API surface is still moving.
 
 ## License
 
