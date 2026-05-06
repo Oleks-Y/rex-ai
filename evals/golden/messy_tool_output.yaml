@@ -1,0 +1,178 @@
+source:
+  name: rex-ai messy-tool-output diagnostic tasks
+  url: https://github.com/rex-ai
+  license: MIT
+  pulled_at: 2026-05-04
+  pinned_revision: v0.1.0-mto-001
+  notes: |
+    Tasks where the agent receives noisy / partial / inconsistent tool
+    output and the *implicit* correct strategy is to use reflect() to
+    stage parsing/cleaning before replying. The task wording NEVER says
+    "use reflect" — it asks a single question whose right answer requires
+    multi-stage processing of the fetched data.
+
+    Naive one-shot agents (fetch → blind reply / dump raw blob) score 0.
+    Agents that script the post-processing in one step also pass —
+    code-action shines here. The point is to test whether the model
+    *figures out* it needs to clean before answering.
+
+agent: web
+tasks:
+  # ── 1. Schema inconsistency (issues vs PRs) ────────────────────────────
+  - id: mto-001-issues-not-prs
+    task: |
+      Fetch https://api.github.com/repos/denoland/deno/issues?state=open&per_page=30
+      with header Accept: application/vnd.github+json. Of the entries
+      returned, how many are *actual issues* (NOT pull requests)? Reply
+      with only the integer count. Note: GitHub's /issues endpoint mixes
+      issues and PRs; PRs have a `pull_request` field, issues do not.
+    grader:
+      type: numeric_match
+      op: range
+      range: [0, 30]
+    agent: web
+    max_steps: 4
+    tags: [reflect, schema-filter, github-api]
+
+  # ── 2. HTML soup → structured fact ─────────────────────────────────────
+  - id: mto-002-html-deno-version
+    task: |
+      Fetch https://deno.com/ (HTML) and report the Deno version number
+      it currently advertises on the homepage. Strip any "v" prefix and
+      reply with only the version string in the form "X.Y.Z". The HTML
+      is full of marketing text and unrelated numbers — find the version
+      specifically.
+    grader:
+      type: regex_match
+      pattern: "^\\s*\\d+\\.\\d+\\.\\d+\\s*$"
+    agent: web
+    max_steps: 4
+    tags: [reflect, html-parse, extraction]
+
+  # ── 3. Pagination implied by counts ────────────────────────────────────
+  - id: mto-003-paginated-stargazers-implied
+    task: |
+      Fetch https://api.github.com/repos/denoland/deno (Accept:
+      application/vnd.github+json) and report the EXACT integer
+      stargazers_count value. The /stargazers endpoint paginates at 100
+      per page — do not try to enumerate, the metadata already tells you.
+      Reply with only the number.
+    grader:
+      type: numeric_match
+      op: ">="
+      expected: 90000
+    agent: web
+    max_steps: 3
+    tags: [reflect, pagination-aware, source-selection]
+
+  # ── 4. Multi-axis aggregation (top language by bytes) ──────────────────
+  - id: mto-004-language-bytes-max
+    task: |
+      Fetch https://api.github.com/repos/denoland/deno/languages with
+      header Accept: application/vnd.github+json. The response is a
+      JSON object mapping language names to byte counts. Reply with
+      only the name of the language with the LARGEST byte count.
+    grader:
+      type: exact_match
+      expected: "Rust"
+    agent: web
+    max_steps: 3
+    tags: [reflect, aggregation, json-shape]
+
+  # ── 5. Time-series — sum non-zero days (anomaly tolerance) ─────────────
+  - id: mto-005-npm-downloads-nonzero
+    task: |
+      Fetch https://api.npmjs.org/downloads/range/last-week/zod and
+      report how many days in the returned `downloads` array had a
+      non-zero `downloads` count. Reply with only the integer (0–7).
+    grader:
+      type: numeric_match
+      op: range
+      range: [0, 7]
+    agent: web
+    max_steps: 4
+    tags: [reflect, time-series, filter-then-count]
+
+  # ── 6. Deduplication after fetch ───────────────────────────────────────
+  - id: mto-006-unique-labels
+    task: |
+      Fetch https://api.github.com/repos/denoland/deno/issues?state=open&per_page=20
+      (Accept: application/vnd.github+json). Across all issues, count
+      the number of DISTINCT label names (case-insensitive — treat
+      "Bug" and "bug" as the same). Reply with only the integer.
+    grader:
+      type: numeric_match
+      op: range
+      range: [0, 60]
+    agent: web
+    max_steps: 4
+    tags: [reflect, dedup, case-insensitive]
+
+  # ── 7. Cross-reference between two fetches ─────────────────────────────
+  - id: mto-007-contributors-vs-issue-authors
+    task: |
+      Fetch:
+        (A) https://api.github.com/repos/denoland/deno/contributors?per_page=10
+        (B) https://api.github.com/repos/denoland/deno/issues?state=open&per_page=20
+      both with Accept: application/vnd.github+json.
+
+      How many of the top-10 contributors (from A) are ALSO authors of
+      any open issue (in B's `user.login` field)? Reply with only the
+      integer (0–10).
+    grader:
+      type: numeric_match
+      op: range
+      range: [0, 10]
+    agent: web
+    max_steps: 5
+    tags: [reflect, cross-reference, set-intersection]
+
+  # ── 8. Truncated content awareness ─────────────────────────────────────
+  - id: mto-008-truncation-aware
+    task: |
+      Fetch https://raw.githubusercontent.com/denoland/deno/main/Cargo.lock
+      and reply with a JSON object {"truncated": <bool>, "first_package":
+      "<name>"}. The first_package is the value of the first `name = "..."`
+      that appears under a `[[package]]` header. truncated should be true
+      if the body returned was cut off (the webFetch tool truncates at
+      32 KB — look for that signal in the returned text).
+    grader:
+      type: json_match
+      subset: true
+      expected:
+        truncated: true
+    agent: web
+    max_steps: 3
+    tags: [reflect, truncation, parse-headers]
+
+  # ── 9. Mixed-type field handling (string-vs-number coercion) ───────────
+  - id: mto-009-mixed-id-types
+    task: |
+      Fetch https://api.github.com/repos/denoland/deno/issues?state=open&per_page=15
+      (Accept: application/vnd.github+json). Compute the SUM of the
+      `number` field across the returned entries. The `number` field is
+      always present and integer-valued, but be careful — `id` looks
+      similar and is much larger. Reply with only the sum.
+    grader:
+      type: numeric_match
+      op: ">="
+      expected: 100
+    agent: web
+    max_steps: 3
+    tags: [reflect, field-discipline, aggregation]
+
+  # ── 10. Self-referential cleaning (parse reveals different shape) ──────
+  - id: mto-010-license-from-repo-meta
+    task: |
+      Fetch https://api.github.com/repos/denoland/deno (Accept:
+      application/vnd.github+json) and reply with ONLY the SPDX license
+      identifier of the repo. Note: the field is nested — `license` is
+      an object with `spdx_id`, not a string. Reply with the SPDX id
+      exactly as it appears (e.g. "MIT", "Apache-2.0").
+    grader:
+      type: exact_match
+      expected: "MIT"
+      normalize: "strict"
+    agent: web
+    max_steps: 3
+    tags: [reflect, nested-field, spdx]

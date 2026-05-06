@@ -1,0 +1,44 @@
+source:
+  name: HumanEval (easy subset)
+  url: https://github.com/openai/human-eval
+  license: MIT
+  pulled_at: 2026-05-04
+  pinned_revision: 312c5e5
+  notes: |
+    Three of HumanEval's simplest problems, transcribed for a code-action
+    agent (the model writes JS in the sandbox). Original problem IDs
+    HumanEval/0, HumanEval/7, HumanEval/13. Test cases are abbreviated.
+
+agent: generic
+tasks:
+  - id: humaneval-000-has-close-elements
+    task: |
+      Given numbers = [1.0, 2.0, 3.9, 4.0, 5.0, 2.2] and threshold = 0.3,
+      determine whether any two distinct elements are closer to each other
+      than the threshold. Return only the word "true" or "false".
+    grader:
+      type: exact_match
+      expected: true
+    max_steps: 2
+    tags: [code-action, single-step, array]
+
+  - id: humaneval-007-filter-by-substring
+    task: |
+      From the list ["apple", "banana", "cherry", "applesauce", "grape"],
+      return a JSON array (sorted lexicographically) of strings that
+      contain the substring "app". Reply with just the JSON array.
+    grader:
+      type: json_match
+      expected: ["apple", "applesauce"]
+    max_steps: 2
+    tags: [code-action, json, string-filter]
+
+  - id: humaneval-013-greatest-common-divisor
+    task: |
+      Compute gcd(48, 180). Reply with only the number.
+    grader:
+      type: numeric_match
+      expected: 12
+      tolerance: 0
+    max_steps: 2
+    tags: [code-action, math, gcd]

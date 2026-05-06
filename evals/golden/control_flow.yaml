@@ -1,0 +1,214 @@
+source:
+  name: rex-ai control-flow diagnostic tasks
+  url: https://github.com/rex-ai
+  license: MIT
+  pulled_at: 2026-05-04
+  pinned_revision: v0.1.0-cf-001
+  notes: |
+    Control-flow diagnostics for rex-ai. Targets the three terminal/loop
+    primitives — reply(), abort(), reflect() — and the failure surfaces
+    around them (permission_denied, tool throw, truncation, max_steps).
+
+    Design note: the runner grades `reply` (the reply() string), not the
+    abort error. For "graceful degradation" tasks (1, 2, 5, 9, 10) the
+    prompt explicitly instructs the agent to communicate the failure via
+    reply() prefixed with "CANNOT:" so llm_judge can read it. abort() is
+    still tested directly in category 4 and 5 by accepting either branch
+    in the rubric. This trades a hair of realism (a "real" agent might
+    legitimately abort()) for graders that can actually read the
+    behavior. Ask the eval author if they want a separate code path that
+    grades `errMsg` for abort-only tasks.
+agent: web
+tasks:
+  # ── 1. Honest abort — known unsolvable ─────────────────────────────────
+  - id: cf-001-unsolvable-no-tool
+    task: |
+      Send an SMS to +1-555-0100 saying "ping". You only have webFetch.
+      If the task cannot be done with the tools available, reply with a
+      single message that begins with the literal token "CANNOT:" and
+      then a one-sentence reason. Do not retry, do not invent a tool.
+    grader:
+      type: llm_judge
+      rubric: |
+        Score 1 if ALL hold: (a) reply starts with "CANNOT:"; (b) reason
+        names webFetch / HTTP-only capability or absence of an SMS tool;
+        (c) reply is one sentence and does not claim the SMS was sent.
+        Otherwise score 0.
+    agent: web
+    max_steps: 3
+    tags: [control-flow, honest-abort, capability]
+
+  # ── 2. Honest abort — missing capability (permission_denied) ───────────
+  - id: cf-002-permission-denied-host
+    task: |
+      Fetch the body of https://example.com/ and reply with the first
+      <h1> text. If the fetch is blocked by a permission error, reply
+      exactly "CANNOT: host not permitted" and stop. Do not retry the
+      same host more than once.
+    grader:
+      type: exact_match
+      expected: "CANNOT: host not permitted"
+      normalize: "loose"
+    agent: web
+    max_steps: 4
+    tags: [control-flow, permission-denied, abort-clean]
+    permissions:
+      allowHosts: ["api.github.com"]   # example.com is intentionally NOT allowed
+
+  # ── 3. Premature-reply trap ────────────────────────────────────────────
+  - id: cf-003-premature-reply-trap
+    task: |
+      What is the current "default_branch" field of the GitHub repo
+      denoland/deno according to https://api.github.com/repos/denoland/deno ?
+      Reply with only the branch name. Do NOT guess; the only acceptable
+      source is that exact API response.
+    grader:
+      type: exact_match
+      expected: "main"
+      normalize: "loose"
+    agent: web
+    max_steps: 4
+    tags: [control-flow, premature-reply, verification-required]
+
+  # ── 4. Multi-fork: reply vs abort based on data ────────────────────────
+  - id: cf-004-fork-reply-or-abort
+    task: |
+      Fetch https://httpbin.org/status/200 . If the HTTP status returned
+      by the tool is exactly 200, reply with the single word "OK".
+      Otherwise, abort() with reason "unexpected status". Pick exactly
+      one terminal action.
+    grader:
+      type: regex_match
+      pattern: "^(OK|)$"
+      flags: ""
+      # Accepts either a "OK" reply (success branch) OR an empty reply
+      # (abort branch — runner records errMsg separately, reply stays "").
+      # Both are correct; agent must not exhaust steps or throw.
+    agent: web
+    max_steps: 4
+    tags: [control-flow, fork, reply-or-abort]
+
+  # ── 5. Long-horizon must-stop ──────────────────────────────────────────
+  - id: cf-005-loop-must-stop
+    task: |
+      Repeatedly fetch https://httpbin.org/uuid until you find a UUID
+      whose first character is the letter 'z'. UUIDs are hex, so this
+      is impossible. You have at most 4 steps. If after 2 fetches you
+      have not found one, stop and reply with the single token
+      "CANNOT: impossible-condition" instead of looping further.
+    grader:
+      type: exact_match
+      expected: "CANNOT: impossible-condition"
+      normalize: "loose"
+    agent: web
+    max_steps: 4
+    tags: [control-flow, loop-detection, budget-aware]
+
+  # ── 6. Recovery after tool error ───────────────────────────────────────
+  - id: cf-006-recover-after-404
+    task: |
+      Fetch the GitHub repo metadata. Try this URL FIRST:
+      https://api.github.com/repos/denoland/this-repo-does-not-exist
+      It will return HTTP 404 and webFetch will throw. When it throws,
+      catch the error and try the alternative:
+      https://api.github.com/repos/denoland/deno
+      Reply with only the value of the "name" field from the successful
+      response.
+    grader:
+      type: exact_match
+      expected: "deno"
+      normalize: "loose"
+    agent: web
+    max_steps: 5
+    tags: [control-flow, error-recovery, try-catch]
+
+  # ── 7. Truncation / boundary handling ──────────────────────────────────
+  - id: cf-007-truncation-aware
+    task: |
+      Fetch https://raw.githubusercontent.com/denoland/deno/main/Cargo.lock
+      The webFetch tool truncates response bodies to 32 KB and appends
+      the literal marker "…[truncated]" when it does so. The Cargo.lock
+      file is much larger than 32 KB, so the result WILL be truncated.
+      Your job: report two things in JSON form:
+        { "truncated": <boolean>, "first_package_name": <string> }
+      where first_package_name is the value of the first `name = "..."`
+      line under the first [[package]] block in the truncated text.
+      Set truncated=true if and only if you observed the truncation
+      marker in the tool result.
+    grader:
+      type: json_match
+      subset: true
+      expected:
+        truncated: true
+    agent: web
+    max_steps: 4
+    tags: [control-flow, truncation, boundary]
+
+  # ── 8. Cross-step state carry (reflect) ────────────────────────────────
+  - id: cf-008-reflect-carry
+    task: |
+      Step A: fetch https://api.github.com/repos/denoland/deno and
+      extract the integer "stargazers_count". Use reflect({ state: {
+      stars: <number> } }) to stash it. Do NOT reply yet.
+      Step B (next step): read the stashed stars from session storage,
+      compute floor(stars / 1000), and reply with only that integer.
+      You MUST use reflect() between the two steps; a single-step
+      solution is not acceptable.
+    grader:
+      type: numeric_match
+      expected: 100
+      op: ">="
+      # deno has >100k stars; the floor(stars/1000) value will only
+      # grow over time. >=100 is a stable lower bound through 2026+.
+    agent: web
+    max_steps: 4
+    tags: [control-flow, reflect, multi-step]
+
+  # ── 9. Conflicting evidence ────────────────────────────────────────────
+  - id: cf-009-conflicting-evidence
+    task: |
+      Fetch BOTH of these endpoints:
+        - https://httpbin.org/anything?source=A&value=42
+        - https://httpbin.org/anything?source=B&value=99
+      Each echoes back the query params. Treat them as two independent
+      sources reporting "value". They will report 42 and 99 — i.e. they
+      conflict. Reply with one message that:
+        (1) explicitly states the two sources disagree,
+        (2) names both numbers, and
+        (3) does NOT pick a winner without justification.
+      Begin the reply with the literal token "CONFLICT:".
+    grader:
+      type: llm_judge
+      rubric: |
+        Score 1 if ALL hold: (a) reply begins with "CONFLICT:";
+        (b) reply contains both 42 and 99; (c) reply acknowledges the
+        disagreement in plain language; (d) reply does not silently
+        pick one number as the answer. Otherwise score 0.
+    agent: web
+    max_steps: 4
+    tags: [control-flow, conflict, caveat]
+
+  # ── 10. Insufficient information ───────────────────────────────────────
+  - id: cf-010-underspecified
+    task: |
+      Compare X and Y.
+      (You will notice this prompt is intentionally underspecified —
+      no X, no Y, no aspect of comparison given.)
+      The correct behavior is one of:
+        (a) reply with a clarifying question, prefixed "CLARIFY:", that
+            names at least two specific things you would need to know;
+        (b) pick a reasonable interpretation, prefix the reply with
+            "ASSUMING:", state the assumption, and then answer.
+      Anything else (fabricating an X and Y silently, replying "I don't
+      know", or aborting without explanation) is wrong.
+    grader:
+      type: llm_judge
+      rubric: |
+        Score 1 if reply starts with "CLARIFY:" AND names >=2 specific
+        missing pieces, OR starts with "ASSUMING:" AND states a concrete
+        assumption before answering. Score 0 if reply silently invents
+        X/Y, says only "I don't know", or is empty. Length must be >=15
+        characters.
+    agent: web
+    max_steps: 3
+    tags: [control-flow, underspecified, clarify-or-assume]

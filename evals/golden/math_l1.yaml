@@ -1,0 +1,45 @@
+source:
+  name: MATH (Level 1–2 subset)
+  url: https://github.com/hendrycks/math
+  license: MIT
+  pulled_at: 2026-05-04
+  pinned_revision: 357963a
+  notes: |
+    Three Level-1/2 problems hand-picked to be solvable with code-action
+    arithmetic in the sandbox (no symbolic CAS required). The full MATH
+    dataset has 12,500 problems; importer can pull a wider sample.
+
+agent: math
+tasks:
+  - id: math-l1-001-sum-evens
+    task: |
+      What is the sum of the even integers from 2 to 100 inclusive?
+      Reply with only the number.
+    grader:
+      type: numeric_match
+      expected: 2550
+      tolerance: 0
+    max_steps: 2
+    tags: [math, arithmetic, sandbox-only]
+
+  - id: math-l1-002-area-circle
+    task: |
+      A circle has a radius of 7. Compute its area to 4 decimal places
+      using pi = 3.14159265358979. Reply with only the number.
+    grader:
+      type: numeric_match
+      expected: 153.9380
+      tolerance: 0.001
+    max_steps: 2
+    tags: [math, geometry, sandbox-only]
+
+  - id: math-l1-003-factor-count
+    task: |
+      How many positive integer divisors does 360 have (including 1 and
+      itself)? Reply with only the number.
+    grader:
+      type: numeric_match
+      expected: 24
+      tolerance: 0
+    max_steps: 3
+    tags: [math, number-theory, code-action]

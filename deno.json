@@ -5,11 +5,15 @@
   "exports": "./src/mod.ts",
   "tasks": {
     "test": "deno test --allow-read --allow-write --allow-run --allow-env --allow-net --allow-sys",
-    "test:unit": "deno test --allow-read --allow-write=.rex,/tmp --allow-env --allow-sys tests/unit/",
-    "test:integration": "deno test --allow-read --allow-write --allow-run --allow-env --allow-net --allow-sys tests/integration/",
+    "test:unit": "deno test --allow-read --allow-write=.rex,/tmp --allow-env --allow-sys tests/unit/ evals/tests/unit/",
+    "test:integration": "deno test --allow-read --allow-write --allow-run --allow-env --allow-net --allow-sys tests/integration/ evals/tests/integration/",
     "lint": "deno lint",
     "fmt": "deno fmt",
-    "check": "deno check src/ tests/"
+    "check": "deno check src/ tests/ evals/",
+    "eval:l1": "deno run --allow-read --allow-write --allow-run --allow-env --allow-net --allow-sys evals/runner.ts --layer l1",
+    "eval:l2": "deno run --allow-read --allow-write --allow-run --allow-env --allow-net --allow-sys evals/bfcl/run.ts",
+    "eval:all": "deno task eval:l1 && deno task eval:l2",
+    "eval:score": "deno run --allow-read --allow-write evals/score.ts"
   },
   "imports": {
     "ai": "npm:ai@5",
@@ -21,6 +25,8 @@
     "@std/io": "jsr:@std/io@0.225",
     "@std/encoding": "jsr:@std/encoding@1",
     "@std/async": "jsr:@std/async@1",
+    "@std/yaml": "jsr:@std/yaml@1",
+    "@std/uuid": "jsr:@std/uuid@1",
     "typescript": "npm:typescript@5"
   },
   "fmt": {
@@ -36,5 +42,5 @@
       "tags": ["recommended"]
     }
   },
-  "exclude": [".rex/", "scratch/"]
+  "exclude": [".rex/", "scratch/", "evals/runs/"]
 }
