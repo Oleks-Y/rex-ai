@@ -7,13 +7,16 @@
 //
 // Structure:
 //   1. RPC framing (inline, mirrors src/rpc.ts wire format)
-//   2. Control fns: reply / abort / reflect
+//   2. Control fns: reply / abort / reflect (synchronous value constructors)
 //   3. writeLib + storage stubs
 //   4. ToolError class + one stub per registered tool
 //   5. console.* override → log events
-//   6. async IIFE wrapping the LLM body
-//   7. catch block: PermissionDenied → permission_denied event;
-//      anything else → throw event; clean return → synthesized abort
+//   6. async IIFE wrapping the LLM body; captures the IIFE's return value
+//   7. After the body resolves: drain in-flight tool calls + log writes,
+//      then dispatch the terminal frame (returned value, or the last call
+//      to a control fn as fallback). Synthesize abort if neither happened.
+//   8. catch block: PermissionDenied → permission_denied event;
+//      anything else → throw event
 
 import type { ToolDescription } from "./tools.ts";
 
@@ -99,24 +102,24 @@ async function __rpcWrite(value: unknown): Promise<void> {
   }
 }
 
-// Track in-flight writes so reply/abort/reflect can drain before exit.
-// (console.log is fire-and-forget; without this, a log started just before
-// a control fn could be lost when Deno.exit truncates the pipe.)
+// Track in-flight fire-and-forget writes (e.g. console.log) so the trailer
+// can drain them before the terminal frame fires.
 const __pendingWrites = new Set<Promise<unknown>>();
 function __trackWrite<T>(p: Promise<T>): Promise<T> {
   __pendingWrites.add(p);
   p.finally(() => __pendingWrites.delete(p));
   return p;
 }
-async function __rpcDrain(): Promise<void> {
+async function __drainPendingWrites(): Promise<void> {
   while (__pendingWrites.size > 0) {
     await Promise.allSettled(Array.from(__pendingWrites));
   }
 }
 
-// ---- Pending RPC requests (id → resolver) ----
+// ---- Pending RPC requests (id → resolver, plus the promise itself) ----
 let __nextRpcId = 0;
-const __pending = new Map<string, (frame: any) => void>();
+const __pendingResolvers = new Map<string, (frame: any) => void>();
+const __pendingCalls = new Set<Promise<unknown>>();
 let __readerRunning = false;
 
 async function __startReaderIfNeeded(): Promise<void> {
@@ -127,12 +130,12 @@ async function __startReaderIfNeeded(): Promise<void> {
   // never need to read past them.
   (async () => {
     try {
-      while (__pending.size > 0) {
+      while (__pendingResolvers.size > 0) {
         const frame = await __rpcRead() as any;
         const id = frame?.id;
         if (typeof id !== "string") continue; // ignore unsolicited
-        const cb = __pending.get(id);
-        if (cb) { __pending.delete(id); cb(frame); }
+        const cb = __pendingResolvers.get(id);
+        if (cb) { __pendingResolvers.delete(id); cb(frame); }
       }
     } catch { /* if we lose the channel mid-call, the awaiter will hang
                   until the parent kills us — acceptable for MVP */ }
@@ -142,34 +145,71 @@ async function __startReaderIfNeeded(): Promise<void> {
 
 async function __rpcCall(type: string, payload: Record<string, unknown>): Promise<any> {
   const id = "r" + (__nextRpcId++);
-  const promise = new Promise<any>((resolve) => { __pending.set(id, resolve); });
+  const promise = new Promise<any>((resolve) => {
+    __pendingResolvers.set(id, resolve);
+  });
+  __pendingCalls.add(promise);
+  promise.finally(() => __pendingCalls.delete(promise));
   await __rpcWrite({ type, id, ...payload });
   __startReaderIfNeeded();
   return promise;
 }
 
-// ---- Control functions (terminal: end the step) ----
-async function reply(message: string): Promise<never> {
-  await __rpcWrite({ type: "reply", message: String(message) });
-  await __rpcDrain();
-  Deno.exit(0);
-  // @ts-ignore unreachable
-  throw 0;
+/** Wait for in-flight RPC calls (tool/storage/writeLib) to settle, then
+ *  flush any fire-and-forget writes. New calls that fire DURING the drain
+ *  (e.g. a then-handler triggers another tool call) are also awaited. */
+async function __drainAllPending(): Promise<void> {
+  while (__pendingCalls.size > 0) {
+    await Promise.allSettled(Array.from(__pendingCalls));
+  }
+  await __drainPendingWrites();
 }
-async function abort(error: string): Promise<never> {
-  await __rpcWrite({ type: "abort", error: String(error) });
-  await __rpcDrain();
-  Deno.exit(0);
-  // @ts-ignore unreachable
-  throw 0;
+
+// ---- Control functions (synchronous value constructors) ----
+//
+// Contract: the LLM body must "return reply(...)" / "return abort(...)" /
+// "return reflect(...)" from its top-level scope. As a safety net, calling
+// any of these *without* returning still records the intent — the trailer
+// uses the most-recent call as fallback. The returned value (if any) wins.
+//
+// These are NOT async and do NOT exit the process. They produce a tagged
+// JS object the trailer dispatches after draining in-flight RPC.
+
+const __REX_TAG = Symbol.for("rex.control");
+type __ControlValue =
+  | { [__REX_TAG]: true; kind: "reply"; message: string }
+  | { [__REX_TAG]: true; kind: "abort"; error: string }
+  | { [__REX_TAG]: true; kind: "reflect"; state: unknown };
+
+let __recordedControl: __ControlValue | null = null;
+function __isControl(v: unknown): v is __ControlValue {
+  return !!v && typeof v === "object" && (v as any)[__REX_TAG] === true;
 }
-async function reflect(state: unknown): Promise<never> {
-  await __rpcWrite({ type: "reflect", state });
-  await __rpcDrain();
-  Deno.exit(0);
-  // @ts-ignore unreachable
-  throw 0;
+
+function reply(message: string): __ControlValue {
+  const v: __ControlValue = { [__REX_TAG]: true, kind: "reply", message: String(message) };
+  __recordedControl = v;
+  return v;
 }
+function abort(error: string): __ControlValue {
+  const v: __ControlValue = { [__REX_TAG]: true, kind: "abort", error: String(error) };
+  __recordedControl = v;
+  return v;
+}
+function reflect(state: unknown): __ControlValue {
+  const v: __ControlValue = { [__REX_TAG]: true, kind: "reflect", state };
+  __recordedControl = v;
+  return v;
+}
+
+// Also expose on globalThis so a defensive globalThis.reply(...) lookup
+// (which some models reach for) still works.
+// deno-lint-ignore no-explicit-any
+(globalThis as any).reply = reply;
+// deno-lint-ignore no-explicit-any
+(globalThis as any).abort = abort;
+// deno-lint-ignore no-explicit-any
+(globalThis as any).reflect = reflect;
 
 // ---- writeLib + storage ----
 async function writeLib(source: string): Promise<void> {
@@ -205,8 +245,8 @@ const __consoleEvent = (level: string) => (...args: unknown[]) => {
     catch { return String(a); }
   });
   // Fire-and-forget; we don't await so console.log inside hot loops doesn't
-  // serialize the whole step. Tracked via __pendingWrites so reply/abort/
-  // reflect drain before exit.
+  // serialize the whole step. Tracked via __pendingWrites so the trailer
+  // drains them before exit.
   __trackWrite(__rpcWrite({ type: "log", level, args: safe })).catch(() => {});
 };
 for (const lvl of ["log","info","warn","error","debug"] as const) {
@@ -228,15 +268,43 @@ function __classifyPermErr(e: Error): { permission: string; target: string } {
 
 const PRELUDE_TRAILER_TEMPLATE = String.raw`
 // ---- LLM body wrapper ----
+async function __dispatch(ctrl: __ControlValue | null): Promise<void> {
+  if (!ctrl) {
+    await __rpcWrite({
+      type: "abort",
+      error:
+        "agent code finished without calling or returning reply(), abort(), or reflect()",
+    });
+    return;
+  }
+  switch (ctrl.kind) {
+    case "reply":
+      await __rpcWrite({ type: "reply", message: ctrl.message });
+      return;
+    case "abort":
+      await __rpcWrite({ type: "abort", error: ctrl.error });
+      return;
+    case "reflect":
+      await __rpcWrite({ type: "reflect", state: ctrl.state });
+      return;
+  }
+}
+
 try {
-  await (async () => {
+  // The LLM body runs inside this async IIFE. Its return value (if any)
+  // becomes the terminal frame.
+  const __returned = await (async () => {
     /*<<<LLM_CODE>>>*/
   })();
-  // No control function called → synthesize an abort.
-  await __rpcWrite({
-    type: "abort",
-    error: "agent code returned without calling reply(), abort(), or reflect()",
-  });
+  // Drain in-flight tool/storage/writeLib calls and any fire-and-forget log
+  // writes BEFORE the terminal frame fires. This prevents fire-and-forget
+  // tool calls (e.g. sendEmail without await) from being orphaned by exit.
+  await __drainAllPending();
+  // Prefer the value the body returned; fall back to the last call to a
+  // control fn so the older "await reply(...)" style still works.
+  const ctrl = __isControl(__returned) ? __returned : __recordedControl;
+  await __dispatch(ctrl);
+  await __drainPendingWrites();
   Deno.exit(0);
 } catch (e) {
   // Deno 2 uses Deno.errors.NotCapable; Deno 1 used PermissionDenied.
@@ -252,7 +320,7 @@ try {
     const msg = e instanceof Error ? (e.stack ?? String(e)) : String(e);
     await __rpcWrite({ type: "throw", error: msg });
   }
-  await __rpcDrain();
+  await __drainPendingWrites();
   Deno.exit(0);
 }
 `;

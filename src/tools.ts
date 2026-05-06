@@ -77,6 +77,16 @@ export class ToolRegistry {
           `tool name "${t.name}" is reserved (one of: ${RESERVED_NAMES.join(", ")})`,
         );
       }
+      // Reject `__*` names. The prelude emits each tool stub into the
+      // same module scope as its own internals (`__rpcBuf`,
+      // `__rpcReader`, `__rex`, etc.); a colliding identifier either
+      // shadows them at runtime or fails to parse. Rather than
+      // enumerate every internal, reserve the entire convention.
+      if (t.name.startsWith("__")) {
+        throw new Error(
+          `tool name "${t.name}" is reserved: names starting with "__" are sandbox internals`,
+        );
+      }
       if (this.#tools.has(t.name)) {
         throw new Error(`duplicate tool name: ${t.name}`);
       }

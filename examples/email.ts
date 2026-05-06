@@ -71,6 +71,7 @@ export default function createAgent(input: AgentFactoryInput): Agent {
     // sendEmail tool, which runs parent-side.
     permissions: {},
     maxSteps: 4,
+    experimental: input.asyncWakeups ? { asyncWakeups: true } : undefined,
   });
 }
 

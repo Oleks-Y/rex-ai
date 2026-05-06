@@ -70,6 +70,23 @@ export interface StepRecord {
   event: SandboxEvent;
 }
 
+export interface ExperimentalOptions {
+  /**
+   * Run all steps inside a single persistent Deno subprocess for the
+   * lifetime of `Agent.run()`, instead of spawning a fresh subprocess
+   * per step. Required by later phases for `scheduleWakeup`, the tasks
+   * API, and the duplex `AgentSession` surface (not yet implemented as
+   * of step 2). Default false.
+   *
+   * Behavior with this flag is intended to match the per-step path for
+   * all currently-tested cases. Differences:
+   *   - Permissions and module allowlist are fixed at session spawn.
+   *   - V8 heap is bounded with `--v8-flags=--max-old-space-size=512`
+   *     by default.
+   */
+  asyncWakeups?: boolean;
+}
+
 export interface AgentOptions {
   model: LanguageModelV2;
   task: string;
@@ -96,12 +113,70 @@ export interface AgentOptions {
    * promise.
    */
   onStep?: (step: StepRecord) => void | Promise<void>;
+  /** Experimental, off by default. See `ExperimentalOptions`. */
+  experimental?: ExperimentalOptions;
 }
 
 export type RunResult =
   | { kind: "reply"; message: string }
   | { kind: "abort"; error: string }
   | { kind: "exhausted"; steps: number };
+
+// ────────────────────────────────────────────────────────────────────────────
+// AgentSession (experimental, behind asyncWakeups flag)
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Inbound message the host sends into a session via `AgentSession.send`. */
+export interface UserMessage {
+  /** Always "user_message". Discriminator for future inbound kinds. */
+  kind: "user_message";
+  content: string;
+}
+
+/** Source of a turn's terminal event. `wakeup` is reserved for step 4+. */
+export type TurnCause = "user" | "wakeup";
+
+/** Event emitted on `AgentSession.events`. */
+export type AgentEvent =
+  | {
+    kind: "step";
+    /** 1-based step index across the session. */
+    index: number;
+    source: "fresh" | "resumed";
+    code: string;
+    event: SandboxEvent;
+  }
+  | {
+    kind: "reply";
+    message: string;
+    /** 1-based turn index across the session (a turn = one user/wakeup
+     *  cause, possibly multiple sandbox steps, ending in a terminal). */
+    turn: number;
+    cause: TurnCause;
+  }
+  | { kind: "abort"; error: string; turn: number; cause: TurnCause }
+  | { kind: "exhausted"; steps: number; turn: number; cause: TurnCause }
+  | {
+    kind: "wakeup_scheduled";
+    id: string;
+    reason: string;
+    wakeupKind: "delay" | "thunk" | "signal";
+  }
+  | { kind: "wakeup_resolved"; id: string }
+  | { kind: "wakeup_rejected"; id: string; error: string }
+  | { kind: "wakeup_cancelled"; id: string; reason: string }
+  | { kind: "session_closed"; reason: string };
+
+export interface AgentSession {
+  /** Outbound stream of session events. Iteration ends after
+   *  `session_closed` is emitted. */
+  readonly events: AsyncIterable<AgentEvent>;
+  /** Inject a user message. Synchronous; queues for the worker. */
+  send(msg: UserMessage): void;
+  /** Cooperative shutdown. Drains the in-flight turn (if any), then
+   *  emits `session_closed` and ends iteration. Idempotent. */
+  close(): Promise<void>;
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Sandbox events (parent's view of one step)
@@ -130,6 +205,30 @@ export type SandboxEvent =
 // ────────────────────────────────────────────────────────────────────────────
 // RPC frames (parent ↔ child)
 // ────────────────────────────────────────────────────────────────────────────
+
+// Child → Parent (wakeup lifecycle, persistent-sandbox only)
+export interface FrameWakeupScheduled {
+  type: "wakeup_scheduled";
+  id: string;
+  reason: string;
+  /** Source kind: a literal `delay` (timer-based), or `thunk` (general
+   *  promise-returning function). `signal` is reserved for step 5. */
+  wakeupKind: "delay" | "thunk" | "signal";
+}
+export interface FrameWakeupResolved {
+  type: "wakeup_resolved";
+  id: string;
+}
+export interface FrameWakeupRejected {
+  type: "wakeup_rejected";
+  id: string;
+  error: string;
+}
+export interface FrameWakeupCancelled {
+  type: "wakeup_cancelled";
+  id: string;
+  reason: string;
+}
 
 // Child → Parent (one-shot terminal events)
 export interface FrameReply {
@@ -227,7 +326,11 @@ export type ChildFrame =
   | FrameStorageSet
   | FrameStorageDel
   | FrameStorageKeys
-  | FrameWriteLib;
+  | FrameWriteLib
+  | FrameWakeupScheduled
+  | FrameWakeupResolved
+  | FrameWakeupRejected
+  | FrameWakeupCancelled;
 
 export type ParentFrame =
   | FrameToolResult
@@ -280,7 +383,12 @@ export class SessionLockedError extends Error {
   }
 }
 
-/** Reserved tool / global names — Agent rejects user tools that collide. */
+/** Reserved tool / global names — Agent rejects user tools that collide.
+ *
+ *  This list MUST stay in sync with the globals installed by the
+ *  prelude(s). Adding a new global to either prelude requires adding
+ *  the name here, otherwise a user tool with the same name would
+ *  silently clobber the prelude declaration. */
 export const RESERVED_NAMES = [
   "reply",
   "abort",
@@ -288,4 +396,7 @@ export const RESERVED_NAMES = [
   "writeLib",
   "storage",
   "console",
+  // prelude_v2 only (gated on `experimental.asyncWakeups`):
+  "scheduleWakeup",
+  "tasks",
 ] as const;

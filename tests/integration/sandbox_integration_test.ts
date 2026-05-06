@@ -193,6 +193,85 @@ Deno.test("returning without a control fn → synthetic abort", async () => {
   });
 });
 
+Deno.test("canonical pattern: `return reply(...)` works", async () => {
+  await withSession(async (session) => {
+    const r = await Sandbox.run({
+      llmCode: 'return reply("returned");',
+      tools: noTools,
+      session,
+      permissions: noPerms,
+      sizeCaps: DEFAULT_SIZE_CAPS,
+    });
+    assertEquals(r.kind, "reply");
+    if (r.kind === "reply") assertEquals(r.message, "returned");
+  });
+});
+
+Deno.test("`return reflect(...)` carries state through", async () => {
+  await withSession(async (session) => {
+    const r = await Sandbox.run({
+      llmCode: 'return reflect({ n: 42 });',
+      tools: noTools,
+      session,
+      permissions: noPerms,
+      sizeCaps: DEFAULT_SIZE_CAPS,
+    });
+    assertEquals(r.kind, "reflect");
+    if (r.kind === "reflect") assertEquals(r.state, { n: 42 });
+  });
+});
+
+Deno.test("returned control wins when both returned and called", async () => {
+  await withSession(async (session) => {
+    const r = await Sandbox.run({
+      // Body calls abort, but RETURNS reply — return value should win.
+      llmCode: `
+        abort("ignored");
+        return reply("kept");
+      `,
+      tools: noTools,
+      session,
+      permissions: noPerms,
+      sizeCaps: DEFAULT_SIZE_CAPS,
+    });
+    assertEquals(r.kind, "reply");
+    if (r.kind === "reply") assertEquals(r.message, "kept");
+  });
+});
+
+Deno.test("fire-and-forget tool call still completes before terminal frame", async () => {
+  // Regression for the T14-class bug: a tool called without `await` must
+  // still execute parent-side before the terminal frame fires (otherwise
+  // we get phantom side effects after the agent has "finished").
+  let toolRan = false;
+  await withSession(async (session) => {
+    const tools = new ToolRegistry([
+      defineTool({
+        name: "mark",
+        description: "set a flag in the parent",
+        schema: z.object({}),
+        handler: () => {
+          toolRan = true;
+          return { ok: true };
+        },
+      }),
+    ]);
+    const r = await Sandbox.run({
+      // No `await` — promise floats. The trailer must still drain it.
+      llmCode: `
+        mark({});
+        return reply("done");
+      `,
+      tools,
+      session,
+      permissions: noPerms,
+      sizeCaps: DEFAULT_SIZE_CAPS,
+    });
+    assertEquals(r.kind, "reply");
+  });
+  assertEquals(toolRan, true);
+});
+
 Deno.test("console.log is captured and surfaced as logs", async () => {
   await withSession(async (session) => {
     const r = await Sandbox.run({
@@ -408,5 +487,36 @@ Deno.test("oversize tool result → ToolResultTooLargeError in sandbox", async (
     });
     assertEquals(r.kind, "reply");
     if (r.kind === "reply") assertEquals(r.message, "caught:ToolResultTooLargeError");
+  });
+});
+
+Deno.test("concurrent in-flight tool calls don't race the stdin writer", async () => {
+  // Regression: the parent used to acquire `proc.stdin.getWriter()` per
+  // frame; multiple simultaneous tool replies threw "stream is already
+  // locked." With the writer held + serialized via a promise chain, a
+  // burst of `Promise.all` calls from the LLM body must all complete.
+  await withSession(async (session) => {
+    const tools = new ToolRegistry([
+      defineTool({
+        name: "echo_n",
+        description: "return the input number",
+        schema: z.object({ n: z.number() }),
+        handler: ({ n }) => n,
+      }),
+    ]);
+    const r = await Sandbox.run({
+      llmCode: `
+        const xs = await Promise.all(
+          Array.from({ length: 16 }, (_, i) => echo_n({ n: i }))
+        );
+        await reply("sum:" + (xs as number[]).reduce((a, b) => a + b, 0));
+      `,
+      tools,
+      session,
+      permissions: noPerms,
+      sizeCaps: DEFAULT_SIZE_CAPS,
+    });
+    assertEquals(r.kind, "reply");
+    if (r.kind === "reply") assertEquals(r.message, "sum:120");
   });
 });

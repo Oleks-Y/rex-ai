@@ -20,8 +20,8 @@ code, which is exactly what Deno's permission flags are for.
 ## What you get
 
 - An `Agent` class that loops `generate → extract code → run in sandbox →
-  observe → repeat` until the script calls `reply()`, `abort()`, or you
-  hit `maxSteps`.
+  observe → repeat` until the script `return`s `reply()`, `abort()`, or
+  you hit `maxSteps`.
 - A Deno subprocess sandbox with **deny-by-default** permissions that
   you opt into per agent (`net`, `read`, `write`, `run`, `modules`).
 - **Parent-side tools** defined with zod schemas — the sandbox calls
@@ -137,6 +137,26 @@ See `examples/` for working factories.
 | [`examples/random_number.ts`](examples/random_number.ts) | Minimal agent, zero tools, zero permissions. |
 | [`examples/github_issues.ts`](examples/github_issues.ts) | Tool with a zod schema + scoped network permission. |
 | [`examples/email.ts`](examples/email.ts) | "Tools = privilege" pattern: zero sandbox permissions, all I/O through a parent-side tool. |
+
+## The control contract (what the LLM writes)
+
+Each step the model emits a single ` ```ts ` block whose top-level
+**returns** one of three control values:
+
+```ts
+return reply("the answer to the user");
+return abort("missing capability X — please grant ...");
+return reflect({ /* state to carry into the next step */ });
+```
+
+`reply` / `abort` / `reflect` are synchronous value constructors. The
+sandbox waits for the body to fully resolve, drains any in-flight tool
+calls and log writes, then dispatches the terminal frame to the parent.
+This is the safe ordering: a `sendEmail` tool call kicked off without
+`await` still finishes before the run ends.
+
+Calling them without `return` also works (the most-recent call wins),
+but `return` is the canonical pattern.
 
 ## Security model in one paragraph
 
