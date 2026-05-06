@@ -1,0 +1,37 @@
+source:
+  name: SimpleQA-style (rex-ai curated)
+  url: https://openai.com/index/introducing-simpleqa/
+  license: MIT (rex-ai curated, OpenAI SimpleQA is MIT)
+  pulled_at: 2026-05-04
+  pinned_revision: rex-curated-001
+  notes: |
+    SimpleQA evaluates short-answer factual recall over the open web.
+    These two tasks are *style-equivalent* — short factual prompts that
+    require either knowledge recall or a webFetch. Importer can pull
+    from the official SimpleQA test set when wired to HF.
+
+agent: web
+tasks:
+  - id: simpleqa-001-deno-version
+    task: |
+      Fetch https://deno.com/ and reply with the latest Deno version
+      number it advertises. Strip any "v" prefix. Reply with only the
+      version (e.g. "1.45.0").
+    grader:
+      type: regex_match
+      pattern: "^\\s*\\d+\\.\\d+\\.\\d+\\s*$"
+      flags: ""
+    max_steps: 4
+    tags: [web, http, factual]
+
+  - id: simpleqa-002-github-stars-deno
+    task: |
+      Fetch https://api.github.com/repos/denoland/deno (Accept:
+      application/vnd.github+json) and reply with the integer
+      stargazer count. Reply with only the number.
+    grader:
+      type: numeric_match
+      op: ">="
+      expected: 90000
+    max_steps: 3
+    tags: [web, http, json-api]

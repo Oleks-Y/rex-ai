@@ -1,0 +1,72 @@
+name: evals-nightly
+
+on:
+  schedule:
+    # 06:00 UTC every day. Cheap enough to run daily; heavy benchmarks
+    # are gated behind the `--benchmarks` arg below.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      models:
+        description: "Comma-separated model aliases"
+        default: "gpt-5-nano"
+      l1_files:
+        description: "L1 files (--file repeatable). Empty = all evals/golden/*.yaml"
+        default: ""
+      bfcl_benchmarks:
+        description: "BFCL benchmarks (comma-separated or shorthand: all-single, all-multi-turn, all)"
+        default: "simple,parallel"
+      budget_usd:
+        description: "Hard cap in USD"
+        default: "5.00"
+
+env:
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+jobs:
+  l1:
+    name: L1 golden set
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Run L1
+        run: |
+          MODELS="${{ github.event.inputs.models || 'gpt-5-nano' }}"
+          BUDGET="${{ github.event.inputs.budget_usd || '5.00' }}"
+          deno task eval:l1 --models "$MODELS" --budget "$BUDGET"
+      - name: Regression gate
+        run: deno run --allow-read --allow-write evals/regression_gate.ts --layer l1
+      - name: Upload run
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: l1-run-${{ github.run_id }}
+          path: evals/runs/
+
+  l2:
+    name: L2 BFCL
+    runs-on: ubuntu-latest
+    needs: l1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Run L2 BFCL
+        run: |
+          MODELS="${{ github.event.inputs.models || 'gpt-5-nano' }}"
+          BENCHMARKS="${{ github.event.inputs.bfcl_benchmarks || 'simple,parallel' }}"
+          deno run --allow-read --allow-write --allow-run --allow-env --allow-net --allow-sys \
+            evals/bfcl/run.ts --models "$MODELS" --benchmarks "$BENCHMARKS"
+      - name: Regression gate
+        run: deno run --allow-read --allow-write evals/regression_gate.ts --layer l2
+      - name: Upload run
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: l2-run-${{ github.run_id }}
+          path: evals/runs/

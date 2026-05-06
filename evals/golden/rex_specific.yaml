@@ -1,0 +1,44 @@
+source:
+  name: rex-ai hand-written diagnostic tasks
+  url: https://github.com/rex-ai
+  license: MIT
+  pulled_at: 2026-05-04
+  pinned_revision: v0.1.0
+agent: generic
+tasks:
+  - id: rex-001-pure-arith
+    task: |
+      Compute (17 * 23) - sqrt(144). Return only the number.
+    grader:
+      type: numeric_match
+      expected: 379
+      tolerance: 0.001
+    max_steps: 2
+    tags: [math, single-step, sandbox-only]
+
+  - id: rex-002-string-pipeline
+    task: |
+      Given the input "the quick brown fox jumps over the lazy dog",
+      return a JSON object with keys: word_count (int), longest_word
+      (string), and unique_letters (sorted array of distinct lowercase
+      letters appearing in the input). Reply with JSON only.
+    grader:
+      type: json_match
+      subset: true
+      expected:
+        word_count: 9
+        longest_word: "jumps"
+    max_steps: 2
+    tags: [json, string-processing, sandbox-only]
+
+  - id: rex-003-multi-step-reflect
+    task: |
+      Compute the first 10 prime numbers, then return the sum of the
+      primes that are greater than 5. Use reflect() at least once to
+      stage intermediate results before replying.
+    grader:
+      type: numeric_match
+      expected: 117
+      tolerance: 0
+    max_steps: 4
+    tags: [math, multi-step, reflect]

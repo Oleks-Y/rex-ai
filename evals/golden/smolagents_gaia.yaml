@@ -1,0 +1,65 @@
+source:
+  name: GAIA-style (rex-ai curated)
+  url: https://huggingface.co/datasets/smolagents/benchmark-v1
+  license: CC-BY-4.0 (gated; rex-ai curated style-equivalents)
+  pulled_at: 2026-05-04
+  pinned_revision: rex-curated-001
+  notes: |
+    The GAIA validation set is gated on HF (requires account + accepting
+    terms), so we ship style-equivalent multi-step research tasks here.
+    The importer (`evals/golden/import.ts`) pulls real GAIA tasks when
+    HF_TOKEN is set.
+
+agent: web
+tasks:
+  - id: gaia-001-multi-fetch-summarize
+    task: |
+      Use webFetch on https://api.github.com/repos/denoland/deno to get
+      the repo metadata, then fetch /releases/latest on the same host.
+      Reply with a JSON object of the form
+      {"tag": "<latest_tag>", "stars": <int>, "language": "<lang>"}.
+    grader:
+      type: json_match
+      subset: true
+      expected:
+        language: "TypeScript"
+    max_steps: 6
+    tags: [web, multi-step, json]
+
+  - id: gaia-002-cross-source-arithmetic
+    task: |
+      Fetch https://api.github.com/repos/denoland/deno/contributors?per_page=5
+      with Accept: application/vnd.github+json. Reply with the SUM of the
+      `contributions` field across the 5 returned contributors. Reply
+      with only the number.
+    grader:
+      type: numeric_match
+      op: ">="
+      expected: 100
+    max_steps: 5
+    tags: [web, multi-step, arithmetic]
+
+  - id: gaia-003-conditional-fetch
+    task: |
+      Fetch https://api.github.com/repos/denoland/deno/issues?state=open&per_page=10
+      with Accept: application/vnd.github+json. Of the issues returned,
+      report HOW MANY have at least one label whose name contains the
+      string "bug" (case-insensitive). Reply with only the number.
+    grader:
+      type: numeric_match
+      op: "range"
+      range: [0, 10]
+    max_steps: 5
+    tags: [web, multi-step, filter]
+
+  - id: gaia-004-text-extraction
+    task: |
+      Fetch https://deno.com/ and report the count of the substring
+      "Deno" (case-sensitive) in the returned HTML. Reply with only the
+      integer count.
+    grader:
+      type: numeric_match
+      op: ">="
+      expected: 5
+    max_steps: 3
+    tags: [web, parsing, substring]
