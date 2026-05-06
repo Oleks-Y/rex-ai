@@ -132,14 +132,20 @@ export const Sandbox = {
     let logsTruncated = false;
     let terminal: SandboxEvent | null = null;
 
-    const writeFrameTo = async (value: unknown) => {
+    // Hold the stdin writer for the lifetime of the run. Acquiring per-call
+    // (`proc.stdin.getWriter()` on each frame) races when multiple in-flight
+    // handlers (concurrent tool/storage calls from the LLM body) try to write
+    // back at the same time and Deno throws "stream is already locked".
+    // Serialize through a promise chain so frames go out in submission order.
+    const stdinWriter = proc.stdin.getWriter();
+    let writeChain: Promise<void> = Promise.resolve();
+    const writeFrameTo = (value: unknown): Promise<void> => {
       const frame = encodeFrame(value);
-      const w = proc.stdin.getWriter();
-      try {
-        await w.write(frame);
-      } finally {
-        w.releaseLock();
-      }
+      const next = writeChain.then(() => stdinWriter.write(frame));
+      // Detach from the chain so one rejected write doesn't poison the rest;
+      // the immediate caller still observes the rejection via `next`.
+      writeChain = next.catch(() => {});
+      return next;
     };
 
     try {
@@ -263,8 +269,10 @@ export const Sandbox = {
       try {
         await reader.cancel();
       } catch { /* */ }
+      // `stdinWriter.close()` closes the underlying pipe; calling
+      // `proc.stdin.close()` while we still hold the lock would throw.
       try {
-        await proc.stdin.close();
+        await stdinWriter.close();
       } catch { /* may already be closed */ }
       try {
         proc.kill("SIGKILL");

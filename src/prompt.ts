@@ -37,6 +37,10 @@ export interface PromptInput {
   permissions: PermissionsConfig | undefined;
   session: SessionSnapshot;
   priorSteps: PriorStep[];
+  /** When true, render documentation for the persistent-session-only
+   *  `scheduleWakeup` and `tasks` globals. Off by default (per-step
+   *  path doesn't expose them). */
+  wakeupsEnabled?: boolean;
 }
 
 export const PromptBuilder = {
@@ -44,6 +48,7 @@ export const PromptBuilder = {
   build(input: PromptInput): string {
     return [
       headerBlock(),
+      input.wakeupsEnabled === true ? wakeupsBlock() : "",
       permissionsBlock(input.permissions),
       toolsBlock(input.tools),
       sessionBlock(input.session),
@@ -183,6 +188,80 @@ function permissionsBlock(p: PermissionsConfig | undefined): string {
   ].join("\n");
 }
 
+function wakeupsBlock(): string {
+  return [
+    "Async wakeups (persistent-session mode):",
+    "",
+    "Two extra globals are available alongside reply/abort/reflect:",
+    "",
+    "  scheduleWakeup<T>(thunk: () => Promise<T> | T, opts?: { reason?: string }): TaskHandle<T>",
+    "  scheduleWakeup.delay(ms: number, opts?: { reason?: string }): TaskHandle<void>",
+    "",
+    "  tasks.list(): TaskHandle[]            — every scheduled wakeup, any status",
+    "  tasks.pending(): TaskHandle[]         — only pending ones",
+    "  tasks.get(id: string): TaskHandle | null",
+    "  tasks.cancel(id: string, reason?: string): boolean",
+    "",
+    "TaskHandle = { id, status: 'pending' | 'resolved' | 'rejected' | 'cancelled',",
+    "               reason, wakeupKind, done: Promise<T>, cancel(reason?: string) }",
+    "",
+    "What scheduleWakeup is for:",
+    "  - Kick off a long-running operation, return reply() to the user, then be",
+    "    woken up later when the operation resolves and continue the conversation.",
+    "  - The TaskHandle and its `done` promise SURVIVE across steps. In a later",
+    "    step you can `await tasks.get(id).done` to retrieve the value.",
+    "",
+    "Wakeup-driven turns (READ CAREFULLY — these are NOT user requests):",
+    "  - When a wakeup fires, the next prompt has a synthetic prior step:",
+    "      { kind: 'reflect', state: { __wakeup: { id, status, detail } } }",
+    "    There is NO `state` global at runtime — that object lives only in the",
+    "    PRIOR-STEPS history above. Read it from there. Do not write",
+    "    `state.__wakeup` in your code; it will throw `state is not defined`.",
+    "    Find the wakeup id by inspecting the most recent synthetic step in",
+    "    'Prior steps:' and then call `tasks.get('<that id>')`.",
+    "  - A wakeup-driven turn is a CONTINUATION, not a re-initialization. Do",
+    "    NOT re-run the original setup code. Do NOT call reply() with your",
+    "    original confirmation message again. The user already received that.",
+    "    Either: (a) handle the wakeup and reply with new info, (b) reflect()",
+    "    if there's nothing user-visible to say yet, or (c) schedule the next",
+    "    iteration of a recurring job and reflect().",
+    "  - For recurring jobs, write the body inside the thunk you pass to",
+    "    scheduleWakeup. The thunk runs in-sandbox each interval; it can call",
+    "    storage.set / scheduleWakeup.delay etc. on its own. When it resolves",
+    "    you get a wakeup turn; usually you just reflect() (no new user reply).",
+    "",
+    "Pattern (typical one-shot):",
+    "  // step N — schedule + reply",
+    "  const h = scheduleWakeup(() => longTool({...}), { reason: 'fetching X' });",
+    "  return reply('Working on it — I will follow up.');",
+    "",
+    "  // step N+K — wakeup-driven turn (synthetic __wakeup in prior steps)",
+    "  const t = tasks.get('w_3');",
+    "  if (t?.status === 'resolved') {",
+    "    const value = await t.done;",
+    "    return reply('Result: ' + JSON.stringify(value));",
+    "  }",
+    "",
+    "Pattern (recurring job, e.g. 'every 30s'):",
+    "  // initial step — schedule a self-rescheduling thunk and reply once",
+    "  const tick = async () => {",
+    "    const batch = makeBatch();",
+    "    const prior = (await storage.get('batches')) as unknown[] ?? [];",
+    "    await storage.set('batches', [...(prior as unknown[]), batch]);",
+    "    scheduleWakeup.delay(30_000, { reason: 'next tick' });",
+    "  };",
+    "  scheduleWakeup(tick, { reason: 'first tick' });",
+    "  return reply('Recurring job started.');",
+    "",
+    "  // wakeup-driven turn — usually just reflect, do NOT re-set-up the job:",
+    "  return reflect({ note: 'tick completed' });",
+    "",
+    "Don't await the handle's done promise SYNCHRONOUSLY in the scheduling step",
+    "unless you want that step to block until it resolves — that defeats the",
+    "purpose. Reply first, then look up the value in the wakeup-driven turn.",
+  ].join("\n");
+}
+
 function toolsBlock(tools: ToolDescription[]): string {
   if (tools.length === 0) {
     return "Tools: (none registered).";
@@ -214,7 +293,14 @@ function sessionBlock(s: SessionSnapshot): string {
     "  - You may rewrite your reusable helper module with `writeLib(source)`.",
     '    Its exports are importable next step via `import { ... } from "session:lib"`.',
     "    writeLib replaces the entire file — include any prior helpers you want to keep.",
-    "  - You may persist data with `storage.{get, set, del, keys}`.",
+    "  - You may persist data with `storage`. ALL FOUR METHODS ARE ASYNC and",
+    "    return Promises — you MUST `await` them:",
+    "      storage.get(key: string): Promise<unknown | undefined>",
+    "      storage.set(key: string, value: unknown): Promise<void>",
+    "      storage.del(key: string): Promise<void>",
+    "      storage.keys(): Promise<string[]>",
+    "    Forgetting `await` will hand you a Promise object and operations like",
+    "    `.push` or `.length` on it will throw at runtime.",
     `  - Current lib.ts exports: ${exports}`,
     "  - Current lib.ts source:",
     indent(src, 6),
@@ -259,10 +345,11 @@ function eventSummary(ev: SandboxEvent): string {
         `The previous tactic FAILED. Do not retry the same code; either change approach or \`return abort(...)\`.`,
       ].join("\n");
     case "reply":
+      // Multi-turn interactive sessions push terminal replies into
+      // priorSteps so the model sees what it told the user last turn.
+      return `Result: reply — message sent to user: ${safeStr(ev.message)}`;
     case "abort":
-      // These are terminal — we shouldn't see them in prior-steps, but if we
-      // do, surface them so the model has full context.
-      return `Result: ${ev.kind}`;
+      return `Result: abort — ${safeStr(ev.error)}`;
   }
 }
 
