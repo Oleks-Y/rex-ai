@@ -50,6 +50,11 @@ export interface SizeCaps {
   storageBytes: number;
   /** Per-step wall-clock cap in ms. Default 60_000. */
   stepTimeoutMs: number;
+  /** Wall-clock cap for awaiting a promise passed to `reflect(promise)`,
+   *  in ms. Independent of `stepTimeoutMs` because the whole point of
+   *  `reflect(promise)` is "I don't know how long this takes." Default
+   *  300_000 (5 min). */
+  reflectPromiseTimeoutMs: number;
 }
 
 export const DEFAULT_SIZE_CAPS: SizeCaps = {
@@ -59,6 +64,7 @@ export const DEFAULT_SIZE_CAPS: SizeCaps = {
   libBytes: 64 * 1024,
   storageBytes: 1024 * 1024,
   stepTimeoutMs: 60_000,
+  reflectPromiseTimeoutMs: 5 * 60_000,
 };
 
 export interface StepRecord {
@@ -74,9 +80,9 @@ export interface ExperimentalOptions {
   /**
    * Run all steps inside a single persistent Deno subprocess for the
    * lifetime of `Agent.run()`, instead of spawning a fresh subprocess
-   * per step. Required by later phases for `scheduleWakeup`, the tasks
-   * API, and the duplex `AgentSession` surface (not yet implemented as
-   * of step 2). Default false.
+   * per step. Required for the timer-based wakeup primitives
+   * (`setTimeout` / `setInterval` / `reflect(promise)`) and the duplex
+   * `AgentSession` surface. Default false.
    *
    * Behavior with this flag is intended to match the per-step path for
    * all currently-tested cases. Differences:
@@ -85,6 +91,19 @@ export interface ExperimentalOptions {
    *     by default.
    */
   asyncWakeups?: boolean;
+  /**
+   * If true, every fire of an intercepted `setTimeout` / `setInterval`
+   * callback automatically wakes the agent — the callback's return
+   * value becomes the synthetic prior step's reflect state. Default
+   * false: a callback only wakes the agent if it explicitly calls
+   * `reflect` (or `reply` / `abort`, which are translated to reflect).
+   *
+   * Useful for monitoring loops that should always surface their
+   * verdict; the default (silent) is better for cheap-predicate polls.
+   * The LLM uses native `setTimeout` / `setInterval` either way — this
+   * flag is a host-side policy, not exposed to the agent code.
+   */
+  autoWakeOnTimer?: boolean;
 }
 
 export interface AgentOptions {
@@ -160,12 +179,26 @@ export type AgentEvent =
     kind: "wakeup_scheduled";
     id: string;
     reason: string;
-    wakeupKind: "delay" | "thunk" | "signal";
+    wakeupKind: WakeupKind;
   }
-  | { kind: "wakeup_resolved"; id: string }
+  | { kind: "wakeup_resolved"; id: string; payload?: WakeupResolvedPayload }
   | { kind: "wakeup_rejected"; id: string; error: string }
   | { kind: "wakeup_cancelled"; id: string; reason: string }
   | { kind: "session_closed"; reason: string };
+
+/** What kind of underlying primitive scheduled this wakeup. */
+export type WakeupKind = "timeout" | "interval" | "promise";
+
+/** Payload attached to a `wakeup_resolved` frame.
+ *  - `state`: a value reflected by the callback (or returned, when the
+ *    `autoWakeOnTimer` policy is on).
+ *  - `intent`: a translated `reply` / `abort` from inside a callback,
+ *    surfaced so the next turn's prompt can render it without firing
+ *    the corresponding side effect from the callback context. */
+export interface WakeupResolvedPayload {
+  state?: unknown;
+  intent?: { kind: "reply" | "abort"; text: string };
+}
 
 export interface AgentSession {
   /** Outbound stream of session events. Iteration ends after
@@ -211,13 +244,23 @@ export interface FrameWakeupScheduled {
   type: "wakeup_scheduled";
   id: string;
   reason: string;
-  /** Source kind: a literal `delay` (timer-based), or `thunk` (general
-   *  promise-returning function). `signal` is reserved for step 5. */
-  wakeupKind: "delay" | "thunk" | "signal";
+  /** Source primitive: `setTimeout` / `setInterval` (timer-based) or an
+   *  unwrapped `reflect(promise)` (`promise`). */
+  wakeupKind: WakeupKind;
+  /** Configured delay (ms) at registration time. Set for timer kinds
+   *  to the `ms` argument passed to `setTimeout` / `setInterval`. Omitted
+   *  for `promise` (no configured period — the promise dictates timing). */
+  delayMs?: number;
 }
 export interface FrameWakeupResolved {
   type: "wakeup_resolved";
   id: string;
+  /** Optional payload describing what (if anything) the callback wants
+   *  to surface to the agent on the next turn. Absent for a silent
+   *  tick (the timer fired but the callback did not call any control
+   *  fn and `autoWakeOnTimer` is off — in which case we skip emitting
+   *  this frame entirely on the child side). */
+  payload?: WakeupResolvedPayload;
 }
 export interface FrameWakeupRejected {
   type: "wakeup_rejected";
@@ -313,6 +356,15 @@ export interface FrameWriteLibResult {
   ok: boolean;
   error?: string;
 }
+/** Parent → Child request to interrupt the in-flight step. Currently
+ *  used to cut short an awaited `reflect(promise)` when the host
+ *  injects a user message — the prelude resolves the wait with an
+ *  `__interrupted_by` sentinel and dispatches the original reflect
+ *  with that payload as state. */
+export interface FrameCancelStep {
+  type: "cancel_step";
+  reason: string;
+}
 
 export type ChildFrame =
   | FrameReply
@@ -335,7 +387,8 @@ export type ChildFrame =
 export type ParentFrame =
   | FrameToolResult
   | FrameStorageResult
-  | FrameWriteLibResult;
+  | FrameWriteLibResult
+  | FrameCancelStep;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Errors
@@ -397,6 +450,12 @@ export const RESERVED_NAMES = [
   "storage",
   "console",
   // prelude_v2 only (gated on `experimental.asyncWakeups`):
-  "scheduleWakeup",
   "tasks",
+  // prelude_v2 wraps the standard timer globals to drive wakeups; a
+  // user-defined tool with one of these names would clobber the
+  // wrapper and silently disable the interception:
+  "setTimeout",
+  "setInterval",
+  "clearTimeout",
+  "clearInterval",
 ] as const;

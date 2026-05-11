@@ -7,7 +7,9 @@
 //   - `send(UserMessage)` from the host
 //   - `wakeup_fired` from the sandbox (via PersistentSandbox handlers)
 // User events preempt queued wakeups; everything is FIFO within a kind.
-// Signal-based wakeups (`scheduleWakeup.signal`) arrive in step 5.
+// A user_message arriving while a `reflect(promise)` wait is in flight
+// also fires a sandbox-side `cancel_step` so the wait resolves
+// synthetically with `__interrupted_by` instead of holding the worker.
 //
 // Public surface (re-exported via mod.ts as `AgentSession`):
 //   - events:  AsyncIterable<AgentEvent>
@@ -34,6 +36,7 @@ import {
   type StepRecord,
   type TurnCause,
   type UserMessage,
+  type WakeupResolvedPayload,
 } from "./types.ts";
 
 /** Internal queue events. */
@@ -43,11 +46,16 @@ type LoopEvent =
   | {
     kind: "wakeup_fired";
     id: string;
-    /** Mirrors the underlying handle's terminal status when fired. */
+    /** Underlying primitive that produced the fire. */
+    wakeupKind: "timeout" | "interval" | "promise";
+    /** Mirrors the descriptor's status at the moment it fired. */
     status: "resolved" | "rejected" | "cancelled";
     /** Error message if `status === "rejected"`, cancel reason if
      *  `cancelled`, otherwise empty. */
     detail: string;
+    /** Payload from the resolving frame. Present only on payload-bearing
+     *  ticks (callback called a control fn, or `autoWakeOnTimer` is on). */
+    payload?: WakeupResolvedPayload;
   };
 
 interface OpenInput {
@@ -61,6 +69,7 @@ interface OpenInput {
   sessionId: string | undefined;
   sessionsRoot: string | undefined;
   onStep?: (step: StepRecord) => void | Promise<void>;
+  autoWakeOnTimer?: boolean;
 }
 
 export class AgentSessionImpl implements AgentSession {
@@ -70,6 +79,7 @@ export class AgentSessionImpl implements AgentSession {
   readonly #sizeCaps: SizeCaps;
   readonly #maxSteps: number;
   readonly #onStep?: (step: StepRecord) => void | Promise<void>;
+  readonly #autoWakeOnTimer: boolean;
 
   readonly #session: SessionStore;
   readonly #sandbox: PersistentSandbox;
@@ -89,6 +99,13 @@ export class AgentSessionImpl implements AgentSession {
 
   #closed = false;
   #closeResult: Promise<void> | null = null;
+  /** id of the wakeup descriptor for an in-flight `reflect(promise)`
+   *  wait, if one is currently being awaited inside the sandbox.
+   *  Set on `wakeup_scheduled` with `wakeupKind: "promise"` and
+   *  cleared on the matching resolved/rejected/cancelled. Used by
+   *  `send()` to fire `cancel_step` so a user message can preempt a
+   *  long promise wait instead of being queued behind it. */
+  #activePromiseWaitId: string | null = null;
 
   readonly events: AsyncIterable<AgentEvent>;
 
@@ -102,6 +119,7 @@ export class AgentSessionImpl implements AgentSession {
     session: SessionStore;
     sandbox: PersistentSandbox;
     initialTask: string;
+    autoWakeOnTimer: boolean;
   }) {
     this.#model = args.model;
     this.#tools = args.tools;
@@ -111,6 +129,7 @@ export class AgentSessionImpl implements AgentSession {
     this.#onStep = args.onStep;
     this.#session = args.session;
     this.#sandbox = args.sandbox;
+    this.#autoWakeOnTimer = args.autoWakeOnTimer;
     this.#inbox = new AsyncQueueInternal<LoopEvent>();
     this.#outbox = new AsyncQueueInternal<AgentEvent>();
     this.events = this.#outbox;
@@ -138,33 +157,19 @@ export class AgentSessionImpl implements AgentSession {
         session,
         permissions: input.permissions,
         sizeCaps: input.sizeCaps,
+        autoWakeOnTimer: input.autoWakeOnTimer,
         wakeupHandlers: {
           onScheduled: (d) => {
-            impl?.["emitWakeupScheduled"](d);
+            impl?.["onWakeupScheduled"](d);
           },
-          onResolved: (id) => {
-            impl?.["enqueueWakeupFired"]({
-              kind: "wakeup_fired",
-              id,
-              status: "resolved",
-              detail: "",
-            });
+          onResolved: (id, payload) => {
+            impl?.["onWakeupResolved"](id, payload);
           },
           onRejected: (id, error) => {
-            impl?.["enqueueWakeupFired"]({
-              kind: "wakeup_fired",
-              id,
-              status: "rejected",
-              detail: error,
-            });
+            impl?.["onWakeupRejected"](id, error);
           },
           onCancelled: (id, reason) => {
-            impl?.["enqueueWakeupFired"]({
-              kind: "wakeup_fired",
-              id,
-              status: "cancelled",
-              detail: reason,
-            });
+            impl?.["onWakeupCancelled"](id, reason);
           },
         },
       });
@@ -183,6 +188,7 @@ export class AgentSessionImpl implements AgentSession {
       session,
       sandbox,
       initialTask: input.task,
+      autoWakeOnTimer: input.autoWakeOnTimer === true,
     });
 
     // Replay (if requested) BEFORE the worker starts. A failure here
@@ -208,6 +214,14 @@ export class AgentSessionImpl implements AgentSession {
     if (!msg || msg.kind !== "user_message" || typeof msg.content !== "string") {
       throw new Error("AgentSession.send: expected { kind: 'user_message', content: string }");
     }
+    // If a step is currently awaiting a `reflect(promise)` wait, fire
+    // a cancel_step so the wait resolves with `__interrupted_by` and
+    // the step terminates promptly. The user message can then be
+    // processed without queueing behind a long promise. Best-effort —
+    // a missed window just means the user waits a bit longer.
+    if (this.#activePromiseWaitId !== null) {
+      this.#sandbox.cancelStep("user_message").catch(() => {});
+    }
     // User messages preempt queued wakeups but stay FIFO with respect
     // to other user messages (per plan §"Ordering rules").
     this.#inbox.pushAhead(
@@ -219,7 +233,8 @@ export class AgentSessionImpl implements AgentSession {
   // ── wakeup hooks called by PersistentSandbox handlers ────────────────
 
   /** @internal — called by the wakeup handler closure in `open()`. */
-  private emitWakeupScheduled(d: import("./persistent_sandbox.ts").WakeupDescriptor): void {
+  private onWakeupScheduled(d: import("./persistent_sandbox.ts").WakeupDescriptor): void {
+    if (d.wakeupKind === "promise") this.#activePromiseWaitId = d.id;
     this.#emit({
       kind: "wakeup_scheduled",
       id: d.id,
@@ -228,19 +243,55 @@ export class AgentSessionImpl implements AgentSession {
     });
   }
 
-  /** @internal — called by the wakeup handler closures in `open()`. */
-  private enqueueWakeupFired(ev: Extract<LoopEvent, { kind: "wakeup_fired" }>): void {
-    // Always surface the lifecycle event to the host, even after
-    // `close()` (the host may want to log the cancellation). Only the
-    // turn enqueue is gated on closed.
-    if (ev.status === "resolved") {
-      this.#emit({ kind: "wakeup_resolved", id: ev.id });
-    } else if (ev.status === "rejected") {
-      this.#emit({ kind: "wakeup_rejected", id: ev.id, error: ev.detail });
-    } else {
-      this.#emit({ kind: "wakeup_cancelled", id: ev.id, reason: ev.detail });
-    }
-    if (!this.#closed) this.#inbox.push(ev);
+  /** @internal — called per `wakeup_resolved` frame. For payload-bearing
+   *  fires, we enqueue a wakeup-driven turn; silent fires only update
+   *  the descriptor (and are not emitted by the prelude in the first
+   *  place for intervals, only for one-shot timeouts). */
+  private onWakeupResolved(id: string, payload?: WakeupResolvedPayload): void {
+    if (this.#activePromiseWaitId === id) this.#activePromiseWaitId = null;
+    this.#emit({ kind: "wakeup_resolved", id, payload });
+    if (this.#closed) return;
+    // Lookup the descriptor to know what kind this was. Default to
+    // "timeout" if absent — silent timeouts already self-pruned but
+    // the worker's own state is unaffected.
+    const desc = this.#sandbox.wakeups().find((w) => w.id === id);
+    const wakeupKind = desc?.wakeupKind ?? "timeout";
+    // Silent fires (no payload) — never wake the agent. Per plan
+    // Issue 8, only explicit reflect / translated reply / abort or the
+    // autoWakeOnTimer policy produces a payload, so this gate is the
+    // single source of truth.
+    if (!payload) return;
+    this.#inbox.push({
+      kind: "wakeup_fired",
+      id,
+      wakeupKind,
+      status: "resolved",
+      detail: "",
+      payload,
+    });
+  }
+
+  /** @internal */
+  private onWakeupRejected(id: string, error: string): void {
+    if (this.#activePromiseWaitId === id) this.#activePromiseWaitId = null;
+    this.#emit({ kind: "wakeup_rejected", id, error });
+    if (this.#closed) return;
+    const desc = this.#sandbox.wakeups().find((w) => w.id === id);
+    const wakeupKind = desc?.wakeupKind ?? "timeout";
+    this.#inbox.push({
+      kind: "wakeup_fired",
+      id,
+      wakeupKind,
+      status: "rejected",
+      detail: error,
+    });
+  }
+
+  /** @internal */
+  private onWakeupCancelled(id: string, reason: string): void {
+    if (this.#activePromiseWaitId === id) this.#activePromiseWaitId = null;
+    this.#emit({ kind: "wakeup_cancelled", id, reason });
+    // Cancellation is a lifecycle event; do NOT enqueue a turn.
   }
 
   close(reason = "closed by host"): Promise<void> {
@@ -295,24 +346,19 @@ export class AgentSessionImpl implements AgentSession {
       this.#lastUserTask = ev.kind === "user_task" ? ev.task : ev.content;
     }
 
-    // For wakeup-driven turns, inject a synthetic prior step so the
-    // model sees "wakeup w_X resolved" inline with prior history. The
-    // payload itself stays in the live JS promise — the agent reads it
-    // via `tasks.get(id).done`.
+    // For wakeup-driven turns, inject a synthetic prior step the next
+    // prompt can render. Shape depends on what fired:
+    //   - timer fire (timeout / interval): a `__from_timer` block with
+    //     id / kind / delayMs, plus the optional `callback_state`
+    //     (whatever the callback reflected) and `translated_intent`
+    //     (a callback-context reply / abort that we converted).
+    //   - reflect(promise) resolution: state is the resolved value.
+    //   - rejection: state surfaces the error.
     if (ev.kind === "wakeup_fired") {
+      const synth = buildWakeupReflectState(ev, this.#sandbox.wakeups().find((w) => w.id === ev.id));
       this.#priorSteps.push({
         code: `// (synthetic) wakeup ${ev.id} ${ev.status}`,
-        event: {
-          kind: "reflect",
-          state: {
-            __wakeup: {
-              id: ev.id,
-              status: ev.status,
-              detail: ev.detail,
-            },
-          },
-          logs: [],
-        },
+        event: { kind: "reflect", state: synth, logs: [] },
       });
     }
 
@@ -349,6 +395,13 @@ export class AgentSessionImpl implements AgentSession {
           this.#emit({ kind: "abort", error: result.error, turn, cause });
           return;
         }
+        // If the step terminated because a parent-issued cancel_step
+        // unblocked an in-flight reflect(promise), the new user message
+        // is already on the inbox. Stop the inner step loop so it gets
+        // processed as its own turn, with the interrupt visible in
+        // priorSteps. This is the only "non_terminal triggers turn end"
+        // case.
+        if (result.kind === "non_terminal" && result.interruptedByUserMessage) return;
       }
       this.#emit({ kind: "exhausted", steps: this.#freshStepCount, turn, cause });
     } catch (e) {
@@ -364,7 +417,7 @@ export class AgentSessionImpl implements AgentSession {
   async #runOneStep(taskForPrompt: string): Promise<
     { kind: "reply"; message: string }
     | { kind: "abort"; error: string }
-    | { kind: "non_terminal" }
+    | { kind: "non_terminal"; interruptedByUserMessage?: boolean }
   > {
     const snapshot = await this.#sessionSnapshot();
     const prompt = PromptBuilder.build({
@@ -373,9 +426,10 @@ export class AgentSessionImpl implements AgentSession {
       permissions: this.#permissions,
       session: snapshot,
       priorSteps: this.#priorSteps,
-      // The persistent-session path always exposes scheduleWakeup +
-      // tasks; teach the model about them.
+      // Persistent-session path always exposes timer-driven wakeups and
+      // reflect(promise); teach the model about them.
       wakeupsEnabled: true,
+      autoWakeOnTimer: this.#autoWakeOnTimer,
     });
 
     const completion = await generateText({
@@ -422,6 +476,17 @@ export class AgentSessionImpl implements AgentSession {
     this.#priorSteps.push({ code, event });
     if (event.kind === "reply") return { kind: "reply", message: event.message };
     if (event.kind === "abort") return { kind: "abort", error: event.error };
+    // Detect the interrupt-by-user-message synthetic reflect (set by
+    // the prelude when a parent cancel_step landed during a
+    // reflect(promise) wait). The state shape is fixed at the prelude
+    // side: `{ __interrupted_by: <reason> }`.
+    if (
+      event.kind === "reflect" && event.state && typeof event.state === "object" &&
+      // deno-lint-ignore no-explicit-any
+      (event.state as any).__interrupted_by === "user_message"
+    ) {
+      return { kind: "non_terminal", interruptedByUserMessage: true };
+    }
     return { kind: "non_terminal" };
   }
 
@@ -476,6 +541,51 @@ export class AgentSessionImpl implements AgentSession {
 // ── helpers (mirrors agent.ts; kept local so step 3 doesn't churn agent.ts) ──
 
 import type { SandboxEvent } from "./types.ts";
+import type { WakeupDescriptor } from "./persistent_sandbox.ts";
+
+/** Build the synthetic `state` blob shown in the wakeup-driven turn's
+ *  prior step. The prompt knows this shape and renders it inline. */
+function buildWakeupReflectState(
+  ev: Extract<LoopEvent, { kind: "wakeup_fired" }>,
+  desc: WakeupDescriptor | undefined,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (ev.wakeupKind === "promise") {
+    // The promise resolved value lives in the actual reflect state of
+    // the previous (real) step — there's nothing extra to inject here.
+    // We only emit a wakeup_fired turn for the rejection case (the
+    // success case is collapsed into the same step's reflect terminal).
+    out.__wakeup = {
+      id: ev.id,
+      kind: "promise",
+      status: ev.status,
+      detail: ev.detail,
+    };
+    return out;
+  }
+  // Timer-driven (timeout / interval). `delayMs` is the configured
+  // period from the original setTimeout/setInterval call (mirrored on
+  // the descriptor), not elapsed wall time.
+  out.__from_timer = {
+    id: ev.id,
+    kind: ev.wakeupKind,
+    delayMs: desc?.delayMs ?? null,
+  };
+  if (ev.status === "rejected") {
+    out.error = ev.detail;
+    return out;
+  }
+  if (ev.payload?.intent) {
+    out.translated_intent = {
+      kind: ev.payload.intent.kind,
+      [ev.payload.intent.kind === "reply" ? "message" : "error"]: ev.payload.intent.text,
+    };
+  }
+  if (ev.payload && Object.prototype.hasOwnProperty.call(ev.payload, "state")) {
+    out.callback_state = ev.payload.state;
+  }
+  return out;
+}
 
 // deno-lint-ignore no-explicit-any
 function summarizeEvent(ev: SandboxEvent): Record<string, any> {

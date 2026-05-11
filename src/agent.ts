@@ -111,6 +111,7 @@ export class Agent {
       sessionId: this.#opts.sessionId,
       sessionsRoot: this.#opts.sessionsRoot,
       onStep: this.#opts.onStep,
+      autoWakeOnTimer: this.#opts.experimental?.autoWakeOnTimer === true,
     });
   }
 

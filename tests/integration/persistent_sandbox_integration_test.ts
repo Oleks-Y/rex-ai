@@ -187,9 +187,9 @@ Deno.test("persistent: cross-step state on globalThis.__rex survives between ste
   // (scheduleWakeup, tasks API) rely on.
   await withTempRoot(async (root) => {
     const { model } = mockModel([
-      `(globalThis as any).__rex.tasks.set("k", 99);
+      `(globalThis as any).__rex.state.set("k", 99);
        await reflect({ stored: true });`,
-      `const v = (globalThis as any).__rex.tasks.get("k");
+      `const v = (globalThis as any).__rex.state.get("k");
        await reply("v=" + v);`,
     ]);
     const r = await new Agent({
