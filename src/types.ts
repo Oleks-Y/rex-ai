@@ -6,6 +6,7 @@
 
 import type { LanguageModelV2 } from "@ai-sdk/provider";
 import type { z } from "zod";
+import type { GuardrailDefinition, GuardrailEvaluation } from "./guardrail.ts";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Public surface (Agent options + result)
@@ -76,6 +77,17 @@ export interface StepRecord {
   event: SandboxEvent;
 }
 
+/** Lifecycle phase of a single in-flight sandbox step.
+ *
+ *  - `generating`: the LLM call (`generateText`) is in flight. The agent
+ *    is waiting on the model to produce code.
+ *  - `running`: the model returned and the sandbox is now executing the
+ *    extracted code.
+ *
+ *  Emitted via `AgentOptions.onPhase` so UIs (CLI spinner, IDE status
+ *  bar, etc.) can show which phase the agent is in without polling. */
+export type AgentPhase = "generating" | "running";
+
 export interface ExperimentalOptions {
   /**
    * Run all steps inside a single persistent Deno subprocess for the
@@ -132,8 +144,54 @@ export interface AgentOptions {
    * promise.
    */
   onStep?: (step: StepRecord) => void | Promise<void>;
+  /**
+   * Called before each fresh step transitions into a new phase
+   * (`generating` then `running`). Lets a UI surface "where" the agent
+   * is mid-step — useful for spinners that distinguish LLM latency from
+   * sandbox latency. Not called for replayed-from-transcript steps.
+   * Host callback errors are swallowed (this is observability only).
+   */
+  onPhase?: (phase: AgentPhase, stepIndex: number) => void;
+  /**
+   * When true (default), the prompt for the FINAL allowed step (the
+   * `maxSteps`-th one within a turn) carries an explicit directive
+   * telling the model it must `return reply(...)` or `return abort(...)`
+   * — anything else ends the turn as `exhausted` with no answer to the user.
+   *
+   * Helpful when an agent has otherwise been making progress via
+   * `reflect(...)` and would silently exhaust its step budget on the last
+   * turn. Set to false to keep the legacy behavior (no directive,
+   * exhaustion possible).
+   */
+  forceFinalReply?: boolean;
   /** Experimental, off by default. See `ExperimentalOptions`. */
   experimental?: ExperimentalOptions;
+  /**
+   * Guardrails — independent LLM checks that run on each sandbox step
+   * and may veto the event. Use `defineGuardrail()` to construct one.
+   * Each guardrail declares which event kinds it cares about and
+   * receives an audit log of the conversation when triggered. A
+   * blocking verdict replaces the original event with a non-terminal
+   * `guardrail_blocked` step tagged with the guardrail's name + reason
+   * and carrying the original payload; the agent loop pushes it to
+   * prior history and runs another step so the model can revise.
+   *
+   * Guardrails fire AFTER the sandbox produces an event but BEFORE it
+   * is written to the transcript or surfaced via `onStep`. The
+   * transcript / step record therefore reflects the post-guardrail
+   * event, so resume / replay sees the same thing the host did.
+   */
+  guardrails?: GuardrailDefinition[];
+  /**
+   * Optional observability hook called once per guardrail evaluation —
+   * including evaluations that allowed the event. Useful for surfacing
+   * guardrail activity in a CLI / UI without parsing the transcript.
+   * Host callback errors are swallowed.
+   */
+  onGuardrail?: (
+    evaluation: GuardrailEvaluation,
+    stepIndex: number,
+  ) => void;
 }
 
 export type RunResult =
@@ -180,6 +238,10 @@ export type AgentEvent =
     id: string;
     reason: string;
     wakeupKind: WakeupKind;
+    /** Configured delay (ms) at registration time. Set for timer kinds
+     *  to the `ms` arg passed to `setTimeout` / `setInterval`. Omitted
+     *  for `promise` (no configured period). */
+    delayMs?: number;
   }
   | { kind: "wakeup_resolved"; id: string; payload?: WakeupResolvedPayload }
   | { kind: "wakeup_rejected"; id: string; error: string }
@@ -233,7 +295,41 @@ export type SandboxEvent =
     target: string;
     logs: SandboxLog[];
   }
-  | { kind: "throw"; error: string; logs: SandboxLog[] };
+  | { kind: "throw"; error: string; logs: SandboxLog[] }
+  /**
+   * Synthetic event produced when a guardrail BLOCKS the sandbox's
+   * original event. Non-terminal: the agent loop pushes it to prior
+   * history and runs another step so the model can revise. The host
+   * sees it via onStep / the transcript like any other event; only the
+   * agent loop's terminal-event check (reply / abort) ignores it.
+   *
+   * `originalKind` is the kind the sandbox actually produced — useful
+   * when the policy reason references the rejected output (e.g.
+   * "your reply was…" vs "your reflect was…").
+   *
+   * `original` carries the full original event payload (minus logs —
+   * those live on the parent `guardrail_blocked` event's `logs` field).
+   * Observers and the next prompt can render exactly what was blocked
+   * so the model knows specifically what to revise.
+   */
+  | {
+    kind: "guardrail_blocked";
+    guardrail: string;
+    reason: string;
+    originalKind: GuardrailBlockedOriginal["kind"];
+    original: GuardrailBlockedOriginal;
+    logs: SandboxLog[];
+  };
+
+/** Original event payload preserved on a `guardrail_blocked` event.
+ *  Same shape as the corresponding `SandboxEvent` variant, minus `logs`
+ *  (those are kept once on the parent `guardrail_blocked` event). */
+export type GuardrailBlockedOriginal =
+  | { kind: "reply"; message: string }
+  | { kind: "abort"; error: string }
+  | { kind: "reflect"; state: unknown }
+  | { kind: "permission_denied"; permission: PermissionKind; target: string }
+  | { kind: "throw"; error: string };
 
 // ────────────────────────────────────────────────────────────────────────────
 // RPC frames (parent ↔ child)
@@ -410,8 +506,13 @@ export class ToolError extends Error {
   }
 }
 
-/** Returned to the sandbox when a tool result exceeds the size cap. */
-export class ToolResultTooLargeError extends Error {
+/** Returned to the sandbox when a tool result exceeds the size cap.
+ *
+ *  Extends `ToolError` so a single `catch (e) { if (e instanceof ToolError) }`
+ *  in agent code handles both validation failures and oversize results.
+ *  `instanceof ToolResultTooLargeError` still works for callers that want
+ *  to discriminate. */
+export class ToolResultTooLargeError extends ToolError {
   constructor(message: string) {
     super(message);
     this.name = "ToolResultTooLargeError";
@@ -459,3 +560,78 @@ export const RESERVED_NAMES = [
   "clearTimeout",
   "clearInterval",
 ] as const;
+
+// ────────────────────────────────────────────────────────────────────────────
+// Trace events (observability — emitted by Tracer, defined in src/trace.ts)
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Envelope fields stamped onto every trace event by `Tracer.emit`. */
+export interface TraceEventEnvelope {
+  /** Monotonically increasing milliseconds since `Tracer` construction. */
+  ts: number;
+  /** Monotonically increasing per-Tracer sequence (starts at 0). */
+  seq: number;
+}
+
+/**
+ * Discriminated union of every structured event the Tracer fans out. The
+ * Tracer fills in `ts` and `seq`; producers pass the variant fields minus
+ * the envelope (see `TraceEventInput` in `src/trace.ts`).
+ *
+ * Re-exported from this module so callers can `import type { TraceEvent }
+ * from "rex/types"` without reaching into the trace module's internals.
+ */
+export type TraceEvent = TraceEventEnvelope & (
+  | {
+    type: "run_started";
+    task: string;
+    maxSteps: number;
+    sessionId: string | null;
+  }
+  | { type: "step_started"; index: number }
+  | { type: "sandbox_spawned"; index: number; pid?: number }
+  | {
+    type: "tool_call_started";
+    index: number;
+    callId: string;
+    name: string;
+    argsBytes: number;
+  }
+  | {
+    type: "tool_call_finished";
+    index: number;
+    callId: string;
+    name: string;
+    ok: boolean;
+    /** Bytes of the JSON-encoded result. Omitted when `ok=false`. */
+    resultBytes?: number;
+    /** Error message when `ok=false`. */
+    error?: string;
+    durationMs: number;
+  }
+  | {
+    type: "storage_op";
+    index: number;
+    op: "get" | "set" | "del" | "keys";
+    /** Key the op was applied to. `null` for `keys` (no key). */
+    key: string | null;
+    ok: boolean;
+  }
+  | {
+    type: "write_lib";
+    index: number;
+    ok: boolean;
+    sourceBytes: number;
+  }
+  | {
+    type: "sandbox_log";
+    index: number;
+    level: SandboxLog["level"];
+  }
+  | {
+    type: "permission_denied";
+    index: number;
+    permission: PermissionKind;
+    target: string;
+  }
+);

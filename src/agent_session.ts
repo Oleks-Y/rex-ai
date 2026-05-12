@@ -23,15 +23,25 @@
 
 import { generateText } from "ai";
 import type { LanguageModelV2 } from "@ai-sdk/provider";
-import { CodeExtractor } from "./extractor.ts";
+import { CodeExtractor, noCodeBlockEvent } from "./extractor.ts";
+import {
+  type GuardrailDefinition,
+  type GuardrailEvaluation,
+  GuardrailRunner,
+} from "./guardrail.ts";
 import { PersistentSandbox } from "./persistent_sandbox.ts";
 import { PromptBuilder, type PriorStep, type SessionSnapshot } from "./prompt.ts";
 import { SessionStore } from "./session.ts";
 import type { ToolRegistry } from "./tools.ts";
 import {
   type AgentEvent,
+  type AgentPhase,
   type AgentSession,
+  type GuardrailBlockedOriginal,
+  NoCodeBlockError,
   type PermissionsConfig,
+  type SandboxEvent,
+  type SandboxLog,
   type SizeCaps,
   type StepRecord,
   type TurnCause,
@@ -69,7 +79,11 @@ interface OpenInput {
   sessionId: string | undefined;
   sessionsRoot: string | undefined;
   onStep?: (step: StepRecord) => void | Promise<void>;
+  onPhase?: (phase: AgentPhase, stepIndex: number) => void;
   autoWakeOnTimer?: boolean;
+  forceFinalReply?: boolean;
+  guardrails?: GuardrailDefinition[];
+  onGuardrail?: (evaluation: GuardrailEvaluation, stepIndex: number) => void;
 }
 
 export class AgentSessionImpl implements AgentSession {
@@ -79,7 +93,14 @@ export class AgentSessionImpl implements AgentSession {
   readonly #sizeCaps: SizeCaps;
   readonly #maxSteps: number;
   readonly #onStep?: (step: StepRecord) => void | Promise<void>;
+  readonly #onPhase?: (phase: AgentPhase, stepIndex: number) => void;
   readonly #autoWakeOnTimer: boolean;
+  readonly #forceFinalReply: boolean;
+  readonly #guardrails: GuardrailDefinition[];
+  readonly #onGuardrail?: (
+    evaluation: GuardrailEvaluation,
+    stepIndex: number,
+  ) => void;
 
   readonly #session: SessionStore;
   readonly #sandbox: PersistentSandbox;
@@ -116,10 +137,14 @@ export class AgentSessionImpl implements AgentSession {
     sizeCaps: SizeCaps;
     maxSteps: number;
     onStep?: (step: StepRecord) => void | Promise<void>;
+    onPhase?: (phase: AgentPhase, stepIndex: number) => void;
     session: SessionStore;
     sandbox: PersistentSandbox;
     initialTask: string;
     autoWakeOnTimer: boolean;
+    forceFinalReply: boolean;
+    guardrails: GuardrailDefinition[];
+    onGuardrail?: (evaluation: GuardrailEvaluation, stepIndex: number) => void;
   }) {
     this.#model = args.model;
     this.#tools = args.tools;
@@ -127,9 +152,13 @@ export class AgentSessionImpl implements AgentSession {
     this.#sizeCaps = args.sizeCaps;
     this.#maxSteps = args.maxSteps;
     this.#onStep = args.onStep;
+    this.#onPhase = args.onPhase;
     this.#session = args.session;
     this.#sandbox = args.sandbox;
     this.#autoWakeOnTimer = args.autoWakeOnTimer;
+    this.#forceFinalReply = args.forceFinalReply;
+    this.#guardrails = args.guardrails;
+    this.#onGuardrail = args.onGuardrail;
     this.#inbox = new AsyncQueueInternal<LoopEvent>();
     this.#outbox = new AsyncQueueInternal<AgentEvent>();
     this.events = this.#outbox;
@@ -185,10 +214,14 @@ export class AgentSessionImpl implements AgentSession {
       sizeCaps: input.sizeCaps,
       maxSteps: input.maxSteps,
       onStep: input.onStep,
+      onPhase: input.onPhase,
       session,
       sandbox,
       initialTask: input.task,
       autoWakeOnTimer: input.autoWakeOnTimer === true,
+      forceFinalReply: input.forceFinalReply ?? true,
+      guardrails: [...(input.guardrails ?? [])],
+      onGuardrail: input.onGuardrail,
     });
 
     // Replay (if requested) BEFORE the worker starts. A failure here
@@ -240,6 +273,7 @@ export class AgentSessionImpl implements AgentSession {
       id: d.id,
       reason: d.reason,
       wakeupKind: d.wakeupKind,
+      delayMs: d.delayMs,
     });
   }
 
@@ -384,7 +418,13 @@ export class AgentSessionImpl implements AgentSession {
       let stepsThisTurn = 0;
       while (stepsThisTurn < this.#maxSteps) {
         if (this.#closed) return;
-        const result = await this.#runOneStep(taskForPrompt);
+        // The step we're about to run is the (stepsThisTurn + 1)-th in
+        // this turn. When that equals maxSteps it's the final allowed
+        // step and the prompt carries a "last step" directive (if the
+        // option is enabled).
+        const lastStep = this.#forceFinalReply &&
+          stepsThisTurn === this.#maxSteps - 1;
+        const result = await this.#runOneStep(taskForPrompt, lastStep);
         stepsThisTurn++;
         this.#freshStepCount++;
         if (result.kind === "reply") {
@@ -414,7 +454,7 @@ export class AgentSessionImpl implements AgentSession {
     }
   }
 
-  async #runOneStep(taskForPrompt: string): Promise<
+  async #runOneStep(taskForPrompt: string, lastStep: boolean): Promise<
     { kind: "reply"; message: string }
     | { kind: "abort"; error: string }
     | { kind: "non_terminal"; interruptedByUserMessage?: boolean }
@@ -430,18 +470,72 @@ export class AgentSessionImpl implements AgentSession {
       // reflect(promise); teach the model about them.
       wakeupsEnabled: true,
       autoWakeOnTimer: this.#autoWakeOnTimer,
+      lastStep,
     });
+
+    const stepIndex = this.#resumedCount + this.#freshStepCount + 1;
+    this.#emitPhase("generating", stepIndex);
 
     const completion = await generateText({
       model: this.#model,
       prompt,
     });
 
-    const code = CodeExtractor.extract(completion.text);
-    const event = await this.#sandbox.runStep({ llmCode: code });
+    // Missing-fence is recoverable: synthesize a `throw` event so the
+    // model sees the error on the next turn and can retry. `maxSteps`
+    // still bounds a chronically broken model. The synthetic event also
+    // runs through guardrails — a policy watching `throw` (or `any`)
+    // should fire whether the throw came from the sandbox or from the
+    // extractor.
+    let code: string;
+    let rawEvent: SandboxEvent;
+    try {
+      code = CodeExtractor.extract(completion.text);
+    } catch (e) {
+      if (!(e instanceof NoCodeBlockError)) throw e;
+      code = "";
+      rawEvent = noCodeBlockEvent(completion.text);
+      const event = await this.#applyGuardrails(
+        rawEvent,
+        code,
+        stepIndex,
+        taskForPrompt,
+      );
+      return await this.#recordAndContinue(stepIndex, code, event);
+    }
 
-    const stepIndex = this.#resumedCount + this.#freshStepCount + 1;
+    this.#emitPhase("running", stepIndex);
+    rawEvent = await this.#sandbox.runStep({ llmCode: code });
 
+    // Guardrails run between the sandbox emitting an event and the host
+    // seeing it. A blocking guardrail replaces the event with a
+    // non-terminal `guardrail_blocked` step carrying the original
+    // payload + reason; the loop keeps going so the model can revise.
+    // The transcript / step / outbox all reflect the post-guardrail
+    // event so resume readers see what really happened.
+    const event = await this.#applyGuardrails(
+      rawEvent,
+      code,
+      stepIndex,
+      taskForPrompt,
+    );
+
+    return await this.#recordAndContinue(stepIndex, code, event);
+  }
+
+  /** Append the step to the transcript, fire `onStep` + outbox `step`
+   *  event, push to prior history, and return a terminal `reply`/`abort`
+   *  or a non-terminal continuation. Shared by the normal path and the
+   *  missing-fence recovery path. */
+  async #recordAndContinue(
+    stepIndex: number,
+    code: string,
+    event: SandboxEvent,
+  ): Promise<
+    { kind: "reply"; message: string }
+    | { kind: "abort"; error: string }
+    | { kind: "non_terminal"; interruptedByUserMessage?: boolean }
+  > {
     await this.#session.appendTranscript({
       step: stepIndex,
       code,
@@ -490,6 +584,33 @@ export class AgentSessionImpl implements AgentSession {
     return { kind: "non_terminal" };
   }
 
+  async #applyGuardrails(
+    rawEvent: SandboxEvent,
+    code: string,
+    stepIndex: number,
+    taskForPrompt: string,
+  ): Promise<SandboxEvent> {
+    if (this.#guardrails.length === 0) return rawEvent;
+    const evaluations = await GuardrailRunner.evaluate(this.#guardrails, {
+      event: rawEvent,
+      code,
+      stepIndex,
+      task: taskForPrompt,
+      priorSteps: this.#priorSteps,
+    });
+    for (const e of evaluations) this.#emitGuardrail(e, stepIndex);
+    const blocking = GuardrailRunner.firstBlock(evaluations);
+    if (blocking === null) return rawEvent;
+    return GuardrailRunner.blockedEvent(rawEvent, blocking);
+  }
+
+  #emitGuardrail(evaluation: GuardrailEvaluation, stepIndex: number): void {
+    if (!this.#onGuardrail) return;
+    try {
+      this.#onGuardrail(evaluation, stepIndex);
+    } catch { /* host callback errors are not fatal */ }
+  }
+
   async #replayTranscript(): Promise<void> {
     const raw = await this.#session.loadTranscript();
     for (const entry of raw) {
@@ -536,11 +657,19 @@ export class AgentSessionImpl implements AgentSession {
   #emit(ev: AgentEvent): void {
     this.#outbox.push(ev);
   }
+
+  /** Fire the optional onPhase callback. Errors are swallowed — phase is
+   *  pure observability and a noisy host should never wedge a step. */
+  #emitPhase(phase: AgentPhase, stepIndex: number): void {
+    if (!this.#onPhase) return;
+    try {
+      this.#onPhase(phase, stepIndex);
+    } catch { /* host callback errors are not fatal */ }
+  }
 }
 
 // ── helpers (mirrors agent.ts; kept local so step 3 doesn't churn agent.ts) ──
 
-import type { SandboxEvent } from "./types.ts";
 import type { WakeupDescriptor } from "./persistent_sandbox.ts";
 
 /** Build the synthetic `state` blob shown in the wakeup-driven turn's
@@ -587,42 +716,141 @@ function buildWakeupReflectState(
   return out;
 }
 
+/** Build a transcript entry for `ev`. Logs are preserved so guardrails on
+ *  a resumed run see the same evidence the original step's prompt did. */
 // deno-lint-ignore no-explicit-any
 function summarizeEvent(ev: SandboxEvent): Record<string, any> {
   switch (ev.kind) {
     case "reply":
-      return { message: ev.message };
+      return { message: ev.message, logs: ev.logs };
     case "abort":
-      return { error: ev.error };
+      return { error: ev.error, logs: ev.logs };
     case "reflect":
-      return { state: ev.state };
+      return { state: ev.state, logs: ev.logs };
     case "permission_denied":
-      return { permission: ev.permission, target: ev.target };
+      return { permission: ev.permission, target: ev.target, logs: ev.logs };
     case "throw":
-      return { error: ev.error };
+      return { error: ev.error, logs: ev.logs };
+    case "guardrail_blocked":
+      return {
+        guardrail: ev.guardrail,
+        reason: ev.reason,
+        originalKind: ev.originalKind,
+        original: ev.original,
+        logs: ev.logs,
+      };
   }
 }
 
 function reconstructEvent(ev: Record<string, unknown>): SandboxEvent | null {
+  const logs = reconstructLogs(ev.logs);
   switch (ev.kind) {
     case "reply":
-      return { kind: "reply", message: String(ev.message ?? ""), logs: [] };
+      return { kind: "reply", message: String(ev.message ?? ""), logs };
     case "abort":
-      return { kind: "abort", error: String(ev.error ?? ""), logs: [] };
+      return { kind: "abort", error: String(ev.error ?? ""), logs };
     case "reflect":
-      return { kind: "reflect", state: ev.state, logs: [] };
+      return { kind: "reflect", state: ev.state, logs };
     case "permission_denied":
       return {
         kind: "permission_denied",
         permission: (ev.permission ?? "read") as SandboxEvent extends
           { kind: "permission_denied"; permission: infer P } ? P : never,
         target: String(ev.target ?? ""),
-        logs: [],
+        logs,
       };
     case "throw":
-      return { kind: "throw", error: String(ev.error ?? ""), logs: [] };
+      return { kind: "throw", error: String(ev.error ?? ""), logs };
+    case "guardrail_blocked": {
+      const original = reconstructGuardrailOriginal(
+        ev.original,
+        ev.originalKind,
+      );
+      return {
+        kind: "guardrail_blocked",
+        guardrail: String(ev.guardrail ?? "unknown"),
+        reason: String(ev.reason ?? ""),
+        originalKind: original.kind,
+        original,
+        logs,
+      };
+    }
     default:
       return null;
+  }
+}
+
+/** Rehydrate a `SandboxLog[]` from a transcript entry's `logs` field.
+ *  Tolerant of older transcripts (no `logs` → `[]`) and malformed
+ *  entries (skipped). */
+function reconstructLogs(raw: unknown): SandboxLog[] {
+  if (!Array.isArray(raw)) return [];
+  const valid = new Set<SandboxLog["level"]>(["log", "info", "warn", "error", "debug"]);
+  const out: SandboxLog[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const e = entry as Record<string, unknown>;
+    const level = valid.has(e.level as SandboxLog["level"])
+      ? (e.level as SandboxLog["level"])
+      : "log";
+    const args = Array.isArray(e.args) ? e.args : [];
+    out.push({ level, args });
+  }
+  return out;
+}
+
+/** Rebuild the `original` payload on a guardrail_blocked transcript entry.
+ *  Prefers the persisted `original` field; falls back to a minimal payload
+ *  derived from `originalKind` when the transcript predates the field. */
+function reconstructGuardrailOriginal(
+  raw: unknown,
+  originalKindRaw: unknown,
+): GuardrailBlockedOriginal {
+  const allowed = new Set<GuardrailBlockedOriginal["kind"]>([
+    "reply",
+    "abort",
+    "reflect",
+    "permission_denied",
+    "throw",
+  ]);
+  if (raw && typeof raw === "object") {
+    const o = raw as Record<string, unknown>;
+    if (typeof o.kind === "string" && allowed.has(o.kind as GuardrailBlockedOriginal["kind"])) {
+      switch (o.kind) {
+        case "reply":
+          return { kind: "reply", message: String(o.message ?? "") };
+        case "abort":
+          return { kind: "abort", error: String(o.error ?? "") };
+        case "reflect":
+          return { kind: "reflect", state: o.state };
+        case "permission_denied":
+          return {
+            kind: "permission_denied",
+            permission: (o.permission ?? "read") as GuardrailBlockedOriginal extends
+              { kind: "permission_denied"; permission: infer P } ? P : never,
+            target: String(o.target ?? ""),
+          };
+        case "throw":
+          return { kind: "throw", error: String(o.error ?? "") };
+      }
+    }
+  }
+  const k =
+    typeof originalKindRaw === "string" &&
+    allowed.has(originalKindRaw as GuardrailBlockedOriginal["kind"])
+      ? (originalKindRaw as GuardrailBlockedOriginal["kind"])
+      : "throw";
+  switch (k) {
+    case "reply":
+      return { kind: "reply", message: "" };
+    case "abort":
+      return { kind: "abort", error: "" };
+    case "reflect":
+      return { kind: "reflect", state: undefined };
+    case "permission_denied":
+      return { kind: "permission_denied", permission: "read", target: "" };
+    case "throw":
+      return { kind: "throw", error: "" };
   }
 }
 

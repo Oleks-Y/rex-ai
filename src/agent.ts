@@ -25,17 +25,26 @@
 
 import { generateText } from "ai";
 import { AgentSessionImpl } from "./agent_session.ts";
-import { CodeExtractor } from "./extractor.ts";
+import { CodeExtractor, noCodeBlockEvent } from "./extractor.ts";
+import {
+  type GuardrailDefinition,
+  type GuardrailEvaluation,
+  GuardrailRunner,
+} from "./guardrail.ts";
 import { PromptBuilder, type PriorStep, type SessionSnapshot } from "./prompt.ts";
 import { Sandbox } from "./sandbox.ts";
 import { SessionStore } from "./session.ts";
 import { ToolRegistry } from "./tools.ts";
 import {
   type AgentOptions,
+  type AgentPhase,
   type AgentSession,
   DEFAULT_SIZE_CAPS,
+  type GuardrailBlockedOriginal,
+  NoCodeBlockError,
   type RunResult,
   type SandboxEvent,
+  type SandboxLog,
   type SizeCaps,
 } from "./types.ts";
 
@@ -68,6 +77,8 @@ export class Agent {
   readonly #tools: ToolRegistry;
   readonly #sizeCaps: SizeCaps;
   readonly #maxSteps: number;
+  readonly #forceFinalReply: boolean;
+  readonly #guardrails: GuardrailDefinition[];
 
   constructor(opts: AgentOptions) {
     if (typeof opts.task !== "string" || opts.task.length === 0) {
@@ -85,6 +96,11 @@ export class Agent {
       throw new Error("Agent: `maxSteps` must be a positive integer");
     }
     this.#maxSteps = ms;
+    this.#forceFinalReply = opts.forceFinalReply ?? true;
+    // Snapshot so a later mutation to the caller's array doesn't change
+    // behavior mid-run. Names need not be unique — multiple guardrails
+    // with the same name are legal (different models, different prompts).
+    this.#guardrails = [...(opts.guardrails ?? [])];
   }
 
   /**
@@ -111,7 +127,11 @@ export class Agent {
       sessionId: this.#opts.sessionId,
       sessionsRoot: this.#opts.sessionsRoot,
       onStep: this.#opts.onStep,
+      onPhase: this.#opts.onPhase,
       autoWakeOnTimer: this.#opts.experimental?.autoWakeOnTimer === true,
+      forceFinalReply: this.#forceFinalReply,
+      guardrails: this.#guardrails,
+      onGuardrail: this.#opts.onGuardrail,
     });
   }
 
@@ -208,8 +228,10 @@ export class Agent {
 
   /** Run a single sandbox step. Returns the terminal `RunResult` if the
    *  step ended in reply/abort, or `null` if it was non-terminal (in which
-   *  case the step has been pushed to `state.priorSteps`). Throws on
-   *  unrecoverable errors (e.g. NoCodeBlockError from extractor). */
+   *  case the step has been pushed to `state.priorSteps`). A missing
+   *  code fence is recoverable: it surfaces as a synthetic `throw` step
+   *  the model sees on the next turn. Other extractor or sandbox
+   *  failures still bubble. */
   async #runOneStep(
     ev: LoopEvent,
     session: SessionStore,
@@ -219,24 +241,56 @@ export class Agent {
     // `ev` only carries `user_task` today; reading `ev.task` here makes the
     // shape ready for `user_message` / `wakeup_fired` events to inject their
     // own prompt context in step 2 without changing this site again.
+    // freshStepCount is the count of fresh steps ALREADY executed in this
+    // run. The step we're about to run is the (freshStepCount + 1)-th. So
+    // when freshStepCount === maxSteps - 1, this is the final allowed step.
+    const lastStep = this.#forceFinalReply &&
+      state.freshStepCount === this.#maxSteps - 1;
     const prompt = PromptBuilder.build({
       task: ev.task,
       tools: this.#tools.describe(),
       permissions: this.#opts.permissions,
       session: snapshot,
       priorSteps: state.priorSteps,
+      lastStep,
     });
+
+    const stepIndex = state.resumedCount + state.freshStepCount + 1;
+    emitPhase(this.#opts.onPhase, "generating", stepIndex);
 
     const completion = await generateText({
       model: this.#opts.model,
       prompt,
     });
 
-    // CodeExtractor throws NoCodeBlockError on missing fence — that's a
-    // hard fail per §10. Caller catches if they want to.
-    const code = CodeExtractor.extract(completion.text);
+    // Missing-fence is recoverable: synthesize a `throw` event and let
+    // the model retry on the next turn. The prompt's prior-steps section
+    // feeds the error back so the model can self-correct. The synthetic
+    // event still goes through guardrails — a policy that watches
+    // `throw` (or `any`) should fire whether the throw came from the
+    // sandbox or from the extractor. Other extractor failures (none
+    // today) would still bubble.
+    let code: string;
+    let rawEvent: SandboxEvent;
+    try {
+      code = CodeExtractor.extract(completion.text);
+    } catch (e) {
+      if (!(e instanceof NoCodeBlockError)) throw e;
+      code = "";
+      rawEvent = noCodeBlockEvent(completion.text);
+      const event = await this.#applyGuardrails(
+        rawEvent,
+        code,
+        stepIndex,
+        ev.task,
+        state.priorSteps,
+      );
+      return await this.#recordStep(session, state, stepIndex, code, event);
+    }
 
-    const event = await Sandbox.run({
+    emitPhase(this.#opts.onPhase, "running", stepIndex);
+
+    rawEvent = await Sandbox.run({
       llmCode: code,
       tools: this.#tools,
       session,
@@ -244,8 +298,35 @@ export class Agent {
       sizeCaps: this.#sizeCaps,
     });
 
-    const stepIndex = state.resumedCount + state.freshStepCount + 1;
+    // Guardrail evaluation happens between the sandbox emitting an event
+    // and the host seeing it. A blocking guardrail replaces the event
+    // with a non-terminal `guardrail_blocked` step (carrying the original
+    // payload + reason) so the loop can keep going and the model gets
+    // another chance to revise. The transcript / onStep / return value
+    // all reflect the post-guardrail event so resume readers see what
+    // really happened.
+    const event = await this.#applyGuardrails(
+      rawEvent,
+      code,
+      stepIndex,
+      ev.task,
+      state.priorSteps,
+    );
 
+    return await this.#recordStep(session, state, stepIndex, code, event);
+  }
+
+  /** Append the step to the transcript, fire `onStep`, and return either a
+   *  terminal `RunResult` (reply/abort) or `null` after pushing the step
+   *  to `state.priorSteps` to keep looping. Shared by the normal path and
+   *  the missing-fence recovery path. */
+  async #recordStep(
+    session: SessionStore,
+    state: LoopState,
+    stepIndex: number,
+    code: string,
+    event: SandboxEvent,
+  ): Promise<RunResult | null> {
     // Always log the step to the transcript for resume / audit.
     await session.appendTranscript({
       step: stepIndex,
@@ -272,6 +353,32 @@ export class Agent {
     // Non-terminal: record and signal "keep looping".
     state.priorSteps.push({ code, event });
     return null;
+  }
+
+  /** Run the configured guardrails against the raw sandbox event. Returns
+   *  the original event when no guardrail blocks; otherwise a non-terminal
+   *  `guardrail_blocked` event tagged with the guardrail's name + reason
+   *  and carrying the original payload. Each evaluation is forwarded to
+   *  `onGuardrail` for observability (errors swallowed). */
+  async #applyGuardrails(
+    rawEvent: SandboxEvent,
+    code: string,
+    stepIndex: number,
+    task: string,
+    priorSteps: PriorStep[],
+  ): Promise<SandboxEvent> {
+    if (this.#guardrails.length === 0) return rawEvent;
+    const evaluations = await GuardrailRunner.evaluate(this.#guardrails, {
+      event: rawEvent,
+      code,
+      stepIndex,
+      task,
+      priorSteps,
+    });
+    for (const e of evaluations) emitGuardrail(this.#opts.onGuardrail, e, stepIndex);
+    const blocking = GuardrailRunner.firstBlock(evaluations);
+    if (blocking === null) return rawEvent;
+    return GuardrailRunner.blockedEvent(rawEvent, blocking);
   }
 
   /** Replay transcript.jsonl as priorSteps. Lets a CLI/UI continue a
@@ -304,27 +411,66 @@ export class Agent {
   }
 }
 
-/** Strip the heavy `logs` field from transcript entries — they go to the
- *  prompt for the *next* step, but persisting them in the JSONL transcript
- *  adds bulk without much resume value. Keep one summary per kind. */
+/** Fire the optional onPhase callback. Errors are swallowed — phase is
+ *  pure observability and a noisy host should never wedge a step. */
+function emitPhase(
+  cb: ((p: AgentPhase, idx: number) => void) | undefined,
+  phase: AgentPhase,
+  stepIndex: number,
+): void {
+  if (!cb) return;
+  try {
+    cb(phase, stepIndex);
+  } catch { /* host callback errors are not fatal */ }
+}
+
+/** Fire the optional onGuardrail callback. Errors are swallowed — this is
+ *  observability only; a host's noisy callback shouldn't change the
+ *  agent's policy outcome. */
+function emitGuardrail(
+  cb: ((e: GuardrailEvaluation, idx: number) => void) | undefined,
+  evaluation: GuardrailEvaluation,
+  stepIndex: number,
+): void {
+  if (!cb) return;
+  try {
+    cb(evaluation, stepIndex);
+  } catch { /* host callback errors are not fatal */ }
+}
+
+/** Build a transcript entry for `ev`. Logs are preserved so guardrails on
+ *  a resumed run see the same evidence the original step's prompt did.
+ *  (Earlier versions stripped logs to keep the JSONL small; that left
+ *  resume-mode guardrails blind. If transcript bulk becomes a concern,
+ *  cap the per-step log byte budget at the SizeCaps level rather than
+ *  dropping logs here.) */
 // deno-lint-ignore no-explicit-any
 function summarizeEvent(ev: SandboxEvent): Record<string, any> {
   switch (ev.kind) {
     case "reply":
-      return { message: ev.message };
+      return { message: ev.message, logs: ev.logs };
     case "abort":
-      return { error: ev.error };
+      return { error: ev.error, logs: ev.logs };
     case "reflect":
-      return { state: ev.state };
+      return { state: ev.state, logs: ev.logs };
     case "permission_denied":
-      return { permission: ev.permission, target: ev.target };
+      return { permission: ev.permission, target: ev.target, logs: ev.logs };
     case "throw":
-      return { error: ev.error };
+      return { error: ev.error, logs: ev.logs };
+    case "guardrail_blocked":
+      return {
+        guardrail: ev.guardrail,
+        reason: ev.reason,
+        originalKind: ev.originalKind,
+        original: ev.original,
+        logs: ev.logs,
+      };
   }
 }
 
-/** Reconstruct PriorStep[] from a session's transcript.jsonl. Logs are not
- *  persisted to the transcript, so resumed steps come back with empty logs. */
+/** Reconstruct PriorStep[] from a session's transcript.jsonl. Logs are
+ *  persisted on each entry, so resumed steps come back with full logs —
+ *  guardrails on a resumed run see the same evidence the live run did. */
 async function loadPriorStepsFromTranscript(session: SessionStore): Promise<PriorStep[]> {
   const raw = await session.loadTranscript();
   const out: PriorStep[] = [];
@@ -339,24 +485,116 @@ async function loadPriorStepsFromTranscript(session: SessionStore): Promise<Prio
 }
 
 function reconstructEvent(ev: Record<string, unknown>): SandboxEvent | null {
+  const logs = reconstructLogs(ev.logs);
   switch (ev.kind) {
     case "reply":
-      return { kind: "reply", message: String(ev.message ?? ""), logs: [] };
+      return { kind: "reply", message: String(ev.message ?? ""), logs };
     case "abort":
-      return { kind: "abort", error: String(ev.error ?? ""), logs: [] };
+      return { kind: "abort", error: String(ev.error ?? ""), logs };
     case "reflect":
-      return { kind: "reflect", state: ev.state, logs: [] };
+      return { kind: "reflect", state: ev.state, logs };
     case "permission_denied":
       return {
         kind: "permission_denied",
         permission: (ev.permission ?? "read") as SandboxEvent extends
           { kind: "permission_denied"; permission: infer P } ? P : never,
         target: String(ev.target ?? ""),
-        logs: [],
+        logs,
       };
     case "throw":
-      return { kind: "throw", error: String(ev.error ?? ""), logs: [] };
+      return { kind: "throw", error: String(ev.error ?? ""), logs };
+    case "guardrail_blocked": {
+      const original = reconstructGuardrailOriginal(
+        ev.original,
+        ev.originalKind,
+      );
+      return {
+        kind: "guardrail_blocked",
+        guardrail: String(ev.guardrail ?? "unknown"),
+        reason: String(ev.reason ?? ""),
+        originalKind: original.kind,
+        original,
+        logs,
+      };
+    }
     default:
       return null;
+  }
+}
+
+/** Rehydrate a `SandboxLog[]` from a transcript entry's `logs` field.
+ *  Tolerant of older transcripts that omit `logs` (returns `[]`) and of
+ *  individual entries with the wrong shape (those are dropped). */
+function reconstructLogs(raw: unknown): SandboxLog[] {
+  if (!Array.isArray(raw)) return [];
+  const valid = new Set<SandboxLog["level"]>(["log", "info", "warn", "error", "debug"]);
+  const out: SandboxLog[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const e = entry as Record<string, unknown>;
+    const level = valid.has(e.level as SandboxLog["level"])
+      ? (e.level as SandboxLog["level"])
+      : "log";
+    const args = Array.isArray(e.args) ? e.args : [];
+    out.push({ level, args });
+  }
+  return out;
+}
+
+/** Rebuild the `original` payload on a guardrail_blocked transcript entry.
+ *  Prefers the persisted `original` field; falls back to a minimal payload
+ *  derived from `originalKind` when the transcript predates the field. */
+function reconstructGuardrailOriginal(
+  raw: unknown,
+  originalKindRaw: unknown,
+): GuardrailBlockedOriginal {
+  const allowed = new Set<GuardrailBlockedOriginal["kind"]>([
+    "reply",
+    "abort",
+    "reflect",
+    "permission_denied",
+    "throw",
+  ]);
+  if (raw && typeof raw === "object") {
+    const o = raw as Record<string, unknown>;
+    if (typeof o.kind === "string" && allowed.has(o.kind as GuardrailBlockedOriginal["kind"])) {
+      switch (o.kind) {
+        case "reply":
+          return { kind: "reply", message: String(o.message ?? "") };
+        case "abort":
+          return { kind: "abort", error: String(o.error ?? "") };
+        case "reflect":
+          return { kind: "reflect", state: o.state };
+        case "permission_denied":
+          return {
+            kind: "permission_denied",
+            permission: (o.permission ?? "read") as GuardrailBlockedOriginal extends
+              { kind: "permission_denied"; permission: infer P } ? P : never,
+            target: String(o.target ?? ""),
+          };
+        case "throw":
+          return { kind: "throw", error: String(o.error ?? "") };
+      }
+    }
+  }
+  // Older transcript entries (pre-`original`-field) only carry
+  // `originalKind`; synthesize an empty-payload variant so resume still
+  // works. The original payload is irretrievable in that case.
+  const k =
+    typeof originalKindRaw === "string" &&
+    allowed.has(originalKindRaw as GuardrailBlockedOriginal["kind"])
+      ? (originalKindRaw as GuardrailBlockedOriginal["kind"])
+      : "throw";
+  switch (k) {
+    case "reply":
+      return { kind: "reply", message: "" };
+    case "abort":
+      return { kind: "abort", error: "" };
+    case "reflect":
+      return { kind: "reflect", state: undefined };
+    case "permission_denied":
+      return { kind: "permission_denied", permission: "read", target: "" };
+    case "throw":
+      return { kind: "throw", error: "" };
   }
 }

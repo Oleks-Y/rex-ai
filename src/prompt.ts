@@ -14,7 +14,11 @@
 // Agent decides how to slot it into the message history.
 
 import type { ToolDescription } from "./tools.ts";
-import type { PermissionsConfig, SandboxEvent } from "./types.ts";
+import type {
+  GuardrailBlockedOriginal,
+  PermissionsConfig,
+  SandboxEvent,
+} from "./types.ts";
 import { zodToTs } from "./zod_to_ts.ts";
 
 export interface PriorStep {
@@ -46,6 +50,10 @@ export interface PromptInput {
   /** Mirrors `ExperimentalOptions.autoWakeOnTimer`. Renders an extra
    *  paragraph clarifying the policy when true. */
   autoWakeOnTimer?: boolean;
+  /** When true, the prompt carries a directive telling the model this is
+   *  its LAST allowed step and it must `return reply(...)` or
+   *  `return abort(...)` — anything else ends the turn as `exhausted`. */
+  lastStep?: boolean;
 }
 
 export const PromptBuilder = {
@@ -59,6 +67,7 @@ export const PromptBuilder = {
       sessionBlock(input.session),
       priorStepsBlock(input.priorSteps),
       taskBlock(input.task),
+      input.lastStep === true ? lastStepBlock() : "",
     ].filter((s) => s.length > 0).join("\n\n");
   },
 };
@@ -91,6 +100,12 @@ function headerBlock(): string {
     "  - Always `await` tool calls (e.g. `await sendEmail({...})`). A",
     "    fire-and-forget tool call still executes parent-side, so don't call",
     "    a side-effecting tool unless you really mean to.",
+    "  - Inside a timer callback (setTimeout / setInterval body) use",
+    "    `reflect(value)` to surface results. Do NOT write `reply(...)` or",
+    "    `abort(...)` from inside a callback — the runtime translates them",
+    "    to reflect-with-intent anyway, and writing `reflect` makes the",
+    "    actual control flow obvious. (Silent callbacks that call NO",
+    "    control fn are fine — they're the predicate-poll pattern.)",
     "",
     "Calling a tool with arguments that fail validation throws a ToolError",
     "carrying the specific zod issues. Catch and recover, or `return abort()`.",
@@ -120,7 +135,8 @@ function headerBlock(): string {
     "    step ONLY when there is no data to inspect: refusing the task,",
     "    asking the user a clarifying question, or answering a pure-knowledge",
     "    question that uses no tools. Otherwise: gather → reflect with logs →",
-    "    review on the next step → reply.",
+    "    review on the next step → reply. A guardrail may enforce this and",
+    "    convert a data-bearing reply with no prior reflect into an abort.",
     "",
     "  - Steps are cheap. Prefer two careful steps over one guess. When you",
     "    don't know the exact shape of a tool's output, a file's contents, or",
@@ -375,6 +391,28 @@ function eventSummary(ev: SandboxEvent): string {
       return `Result: reply — message sent to user: ${safeStr(ev.message)}`;
     case "abort":
       return `Result: abort — ${safeStr(ev.error)}`;
+    case "guardrail_blocked":
+      return [
+        `Result: BLOCKED by guardrail '${ev.guardrail}' — ${ev.reason}`,
+        `Your previous ${ev.originalKind} was rejected by policy and was NOT delivered to the user.`,
+        `Blocked payload: ${renderBlockedOriginal(ev.original)}`,
+        `REVISE your approach to satisfy the policy on the next step. Repeating the same code will block again the same way.`,
+      ].join("\n");
+  }
+}
+
+function renderBlockedOriginal(o: GuardrailBlockedOriginal): string {
+  switch (o.kind) {
+    case "reply":
+      return `reply(${safeStr(o.message)})`;
+    case "abort":
+      return `abort(${safeStr(o.error)})`;
+    case "reflect":
+      return `reflect(${safeStr(o.state)})`;
+    case "permission_denied":
+      return `permission_denied(${o.permission}: ${safeStr(o.target)})`;
+    case "throw":
+      return `threw(${safeStr(o.error)})`;
   }
 }
 
@@ -394,4 +432,21 @@ function safeStr(v: unknown): string {
 
 function taskBlock(task: string): string {
   return `Task: ${task}`;
+}
+
+function lastStepBlock(): string {
+  return [
+    "⚠ LAST STEP — read carefully:",
+    "",
+    "This is your FINAL allowed step in this turn. The runtime will NOT",
+    "generate another step after this one. You MUST end this step with one of:",
+    "  - return reply(<answer>)  — deliver your best answer to the user",
+    "  - return abort(<reason>)  — declare what's missing so the user knows",
+    "",
+    "Anything else (`return reflect(...)`, an uncaught throw, or no terminal",
+    "call at all) ends the turn as EXHAUSTED with NO answer reaching the user.",
+    "Even if your evidence is incomplete, summarize what you DO know in",
+    "reply(), or abort() with a specific account of what's blocking you.",
+    "Do not start new tool work that can't finish in this step.",
+  ].join("\n");
 }
