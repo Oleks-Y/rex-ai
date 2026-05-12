@@ -132,6 +132,7 @@ export class Agent {
       forceFinalReply: this.#forceFinalReply,
       guardrails: this.#guardrails,
       onGuardrail: this.#opts.onGuardrail,
+      extraReadOnlyPaths: this.#opts.extraReadOnlyPaths,
     });
   }
 
@@ -296,6 +297,7 @@ export class Agent {
       session,
       permissions: this.#opts.permissions,
       sizeCaps: this.#sizeCaps,
+      extraReadOnlyPaths: this.#opts.extraReadOnlyPaths,
     });
 
     // Guardrail evaluation happens between the sandbox emitting an event

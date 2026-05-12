@@ -84,6 +84,9 @@ interface OpenInput {
   forceFinalReply?: boolean;
   guardrails?: GuardrailDefinition[];
   onGuardrail?: (evaluation: GuardrailEvaluation, stepIndex: number) => void;
+  /** Extra read-only paths spliced into the sandbox's --allow-read.
+   *  Dreamer-only; every other caller leaves this unset. */
+  extraReadOnlyPaths?: string[];
 }
 
 export class AgentSessionImpl implements AgentSession {
@@ -187,6 +190,7 @@ export class AgentSessionImpl implements AgentSession {
         permissions: input.permissions,
         sizeCaps: input.sizeCaps,
         autoWakeOnTimer: input.autoWakeOnTimer,
+        extraReadOnlyPaths: input.extraReadOnlyPaths,
         wakeupHandlers: {
           onScheduled: (d) => {
             impl?.["onWakeupScheduled"](d);

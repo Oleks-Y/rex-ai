@@ -2,14 +2,17 @@
 // matching. The runtime (DreamPool / DreamWorker) is exercised in
 // integration tests once it lands.
 
-import { assertEquals, assertThrows } from "@std/assert";
+import { assertEquals, assertStringIncludes, assertThrows } from "@std/assert";
 import type { LanguageModelV2 } from "@ai-sdk/provider";
 import {
+  applyBackpressure,
   defineDreamer,
   dreamerMatches,
   dreamerTriggerKind,
   type DreamerDefinition,
+  type DreamLifecycleEvent,
   type DreamPayload,
+  renderPayloadAsUserMessage,
 } from "../../src/dreamer.ts";
 import type { SandboxEvent } from "../../src/types.ts";
 
@@ -202,4 +205,197 @@ Deno.test("dreamerTriggerKind: sandbox event returns event.kind", () => {
 Deno.test("dreamerTriggerKind: synthetic trigger takes precedence", () => {
   const p: DreamPayload = { ...REPLY_PAYLOAD, syntheticTrigger: "user_message" };
   assertEquals(dreamerTriggerKind(p), "user_message");
+});
+
+// ── applyBackpressure ─────────────────────────────────────────────────
+//
+// Pure-function tests; no Agent, no sandbox. Reasoning about the queue
+// in isolation is the whole reason we extracted this.
+
+interface PolicyHarness {
+  queue: DreamPayload[];
+  ids: WeakMap<DreamPayload, string>;
+  events: DreamLifecycleEvent[];
+  nextId: number;
+  /** Emulates `DreamWorker.enqueue`'s id assignment + emit fanout. */
+  enqueue(payload: DreamPayload, opts?: { running?: boolean }): void;
+}
+
+function harness(def: DreamerDefinition): PolicyHarness {
+  const h: PolicyHarness = {
+    queue: [],
+    ids: new WeakMap<DreamPayload, string>(),
+    events: [],
+    nextId: 1,
+    enqueue(payload, opts) {
+      const id = `${def.name}#${h.nextId++}`;
+      h.ids.set(payload, id);
+      applyBackpressure({
+        payload,
+        payloadId: id,
+        queue: h.queue,
+        payloadIds: h.ids,
+        running: opts?.running ?? false,
+        def,
+        emit: (ev) => h.events.push(ev),
+      });
+    },
+  };
+  return h;
+}
+
+function mkPayload(label: string, kind: SandboxEvent["kind"] = "reply"): DreamPayload {
+  const ev: SandboxEvent = kind === "reply"
+    ? { kind: "reply", message: label, logs: [] }
+    : { kind: "reflect", state: { label }, logs: [] };
+  return {
+    event: ev,
+    llmCompletion: `completion-${label}`,
+    code: `// ${label}`,
+    stepIndex: 1,
+    task: "t",
+    userInputs: [{ kind: "task", content: "t", turn: 1 }],
+    turn: 1,
+  };
+}
+
+Deno.test("backpressure: queue policy buffers fires under cap (cap counts running)", () => {
+  // cap=3, running=true → 1 in-flight + up to 2 queued without eviction.
+  const h = harness({ ...VALID, backpressure: "queue", maxQueueDepth: 3 });
+  h.enqueue(mkPayload("a"), { running: true });
+  h.enqueue(mkPayload("b"), { running: true });
+  // queueDepth on the third = 2 (queue) + 1 (running) = 3 ≥ cap → evicts.
+  // Use only 2 enqueues to stay under the cap.
+  assertEquals(h.queue.length, 2);
+  assertEquals(h.events.filter((e) => e.kind === "fired").length, 2);
+  assertEquals(h.events.filter((e) => e.kind === "dropped").length, 0);
+});
+
+Deno.test("backpressure: queue policy not-running can fill to cap", () => {
+  // running=false → cap=3 means up to 3 in the queue without eviction.
+  const h = harness({ ...VALID, backpressure: "queue", maxQueueDepth: 3 });
+  h.enqueue(mkPayload("a"), { running: false });
+  h.enqueue(mkPayload("b"), { running: false });
+  h.enqueue(mkPayload("c"), { running: false });
+  assertEquals(h.queue.length, 3);
+  assertEquals(h.events.filter((e) => e.kind === "dropped").length, 0);
+});
+
+Deno.test("backpressure: queue full → drop_oldest fallback emits dropped", () => {
+  const h = harness({ ...VALID, backpressure: "queue", maxQueueDepth: 2 });
+  const a = mkPayload("a"); const b = mkPayload("b"); const c = mkPayload("c");
+  h.enqueue(a, { running: false });
+  h.enqueue(b, { running: false });
+  h.enqueue(c, { running: false });   // queueDepth was 2 ≥ cap 2 → evict oldest
+  assertEquals(h.queue.length, 2);
+  assertEquals(h.queue[0], b);
+  assertEquals(h.queue[1], c);
+  const dropped = h.events.filter((e) => e.kind === "dropped");
+  assertEquals(dropped.length, 1);
+  assertEquals((dropped[0] as { reason: string }).reason, "queue_full");
+});
+
+Deno.test("backpressure: drop_newest rejects fires while busy or queued", () => {
+  const h = harness({ ...VALID, backpressure: "drop_newest" });
+  h.enqueue(mkPayload("a"), { running: false }); // accepted
+  h.enqueue(mkPayload("b"), { running: true });  // rejected — busy
+  h.enqueue(mkPayload("c"), { running: true });  // rejected — busy
+  assertEquals(h.queue.length, 1);
+  const dropped = h.events.filter((e) => e.kind === "dropped");
+  assertEquals(dropped.length, 2);
+  for (const d of dropped) assertEquals((d as { reason: string }).reason, "drop_newest");
+});
+
+Deno.test("backpressure: drop_oldest evicts the head when a new fire arrives", () => {
+  const h = harness({ ...VALID, backpressure: "drop_oldest" });
+  const a = mkPayload("a"); const b = mkPayload("b"); const c = mkPayload("c");
+  h.enqueue(a, { running: true });
+  h.enqueue(b, { running: true });   // evicts a
+  h.enqueue(c, { running: true });   // evicts b
+  assertEquals(h.queue.length, 1);
+  assertEquals(h.queue[0], c);
+  assertEquals(h.events.filter((e) => e.kind === "dropped").length, 2);
+});
+
+Deno.test("backpressure: coalesce merges same-kind queued fires", () => {
+  const h = harness({ ...VALID, backpressure: "coalesce" });
+  h.enqueue(mkPayload("a", "reply"), { running: true });
+  h.enqueue(mkPayload("b", "reply"), { running: true });   // coalesced
+  h.enqueue(mkPayload("c", "reply"), { running: true });   // coalesced
+  // Single merged payload remains.
+  assertEquals(h.queue.length, 1);
+  // 3 fired, 2 dropped(coalesced).
+  assertEquals(h.events.filter((e) => e.kind === "fired").length, 3);
+  const dropped = h.events.filter((e) => e.kind === "dropped");
+  assertEquals(dropped.length, 2);
+  for (const d of dropped) assertEquals((d as { reason: string }).reason, "coalesced");
+});
+
+Deno.test("backpressure: coalesce does NOT merge different-kind fires", () => {
+  const h = harness({ ...VALID, backpressure: "coalesce" });
+  h.enqueue(mkPayload("a", "reply"), { running: true });
+  h.enqueue(mkPayload("b", "reflect"), { running: true });
+  h.enqueue(mkPayload("c", "reply"), { running: true });
+  // reply, reflect, reply — different kinds so three queue entries.
+  assertEquals(h.queue.length, 3);
+  assertEquals(h.events.filter((e) => e.kind === "fired").length, 3);
+  assertEquals(h.events.filter((e) => e.kind === "dropped").length, 0);
+});
+
+Deno.test("applyBackpressure: always emits `fired` for the incoming payload", () => {
+  const h = harness({ ...VALID, backpressure: "drop_newest" });
+  h.enqueue(mkPayload("a"), { running: true });   // dropped — but still fired
+  assertEquals(h.events.filter((e) => e.kind === "fired").length, 1);
+});
+
+// ── renderPayloadAsUserMessage ────────────────────────────────────────
+
+Deno.test("renderPayloadAsUserMessage: includes trigger, step, code, event, logs", () => {
+  const payload: DreamPayload = {
+    event: { kind: "reply", message: "Sent!", logs: [{ level: "log", args: ["called", "tool"] }] },
+    llmCompletion: "I'll call the email tool…",
+    code: "await sendEmail(); return reply('Sent!');",
+    stepIndex: 4,
+    task: "Email Alice",
+    userInputs: [{ kind: "task", content: "Email Alice", turn: 1 }],
+    turn: 1,
+  };
+  const out = renderPayloadAsUserMessage(payload);
+  assertStringIncludes(out, "trigger: reply");
+  assertStringIncludes(out, "Parent step index: 4");
+  assertStringIncludes(out, "I'll call the email tool");
+  assertStringIncludes(out, "await sendEmail()");
+  assertStringIncludes(out, "Sent!");
+  assertStringIncludes(out, "Email Alice");
+  assertStringIncludes(out, "[log]");
+});
+
+Deno.test("renderPayloadAsUserMessage: uses synthetic trigger in the heading", () => {
+  const payload: DreamPayload = {
+    event: { kind: "reply", message: "", logs: [] },
+    llmCompletion: "",
+    code: "",
+    stepIndex: 1,
+    task: "t",
+    userInputs: [{ kind: "task", content: "t", turn: 1 }],
+    turn: 1,
+    syntheticTrigger: "user_message",
+  };
+  assertStringIncludes(renderPayloadAsUserMessage(payload), "trigger: user_message");
+});
+
+Deno.test("renderPayloadAsUserMessage: collapses code-free / completion-free fires", () => {
+  const payload: DreamPayload = {
+    event: { kind: "reply", message: "x", logs: [] },
+    llmCompletion: "",
+    code: "",
+    stepIndex: 1,
+    task: "t",
+    userInputs: [],
+    turn: 1,
+  };
+  const out = renderPayloadAsUserMessage(payload);
+  // No "Parent LLM completion (raw)" header when empty.
+  assertEquals(out.includes("Parent LLM completion (raw)"), false);
+  assertEquals(out.includes("Parent code (extracted)"), false);
 });

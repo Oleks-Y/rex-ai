@@ -1,8 +1,12 @@
 export { Agent } from "./agent.ts";
 export {
+  applyBackpressure,
   defineDreamer,
+  DreamPool,
+  DreamWorker,
   dreamerMatches,
   dreamerTriggerKind,
+  renderPayloadAsUserMessage,
 } from "./dreamer.ts";
 export type {
   DreamDropReason,
@@ -11,6 +15,7 @@ export type {
   DreamerTrigger,
   DreamLifecycleEvent,
   DreamPayload,
+  DreamPoolOpenInput,
   DreamUserInput,
 } from "./dreamer.ts";
 export { defineTool } from "./tools.ts";

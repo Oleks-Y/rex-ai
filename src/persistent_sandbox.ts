@@ -104,6 +104,9 @@ export interface PersistentSandboxOpenInput {
    *  reflect state). Default false. Mirrors
    *  `ExperimentalOptions.autoWakeOnTimer`. */
   autoWakeOnTimer?: boolean;
+  /** Extra read-only paths spliced into --allow-read. Dreamer-only;
+   *  every non-dreamer call site leaves this unset. */
+  extraReadOnlyPaths?: string[];
 }
 
 /** Mirror size + GC tuning. Plan §"Decisions made" Issue 14: drop
@@ -124,6 +127,7 @@ export class PersistentSandbox {
   readonly #permissions: PermissionsConfig | undefined;
   readonly #sizeCaps: SizeCaps;
   readonly #allowedModules: string[];
+  readonly #extraReadOnlyPaths: string[];
   readonly #wakeupHandlers: WakeupHandlers;
   readonly #wakeupMirror: Map<string, WakeupDescriptor> = new Map();
   readonly #autoWakeOnTimer: boolean;
@@ -174,6 +178,7 @@ export class PersistentSandbox {
     permissions: PermissionsConfig | undefined;
     sizeCaps: SizeCaps;
     allowedModules: string[];
+    extraReadOnlyPaths: string[];
     wakeupHandlers: WakeupHandlers;
     autoWakeOnTimer: boolean;
   }) {
@@ -182,6 +187,7 @@ export class PersistentSandbox {
     this.#permissions = args.permissions;
     this.#sizeCaps = args.sizeCaps;
     this.#allowedModules = args.allowedModules;
+    this.#extraReadOnlyPaths = args.extraReadOnlyPaths;
     this.#wakeupHandlers = args.wakeupHandlers;
     this.#autoWakeOnTimer = args.autoWakeOnTimer;
   }
@@ -194,6 +200,7 @@ export class PersistentSandbox {
       permissions: input.permissions,
       sizeCaps: input.sizeCaps,
       allowedModules,
+      extraReadOnlyPaths: input.extraReadOnlyPaths ?? [],
       wakeupHandlers: input.wakeupHandlers ?? {},
       autoWakeOnTimer: input.autoWakeOnTimer === true,
     });
@@ -217,6 +224,7 @@ export class PersistentSandbox {
       permissions: this.#permissions,
       sessionDir: this.#session.dir,
       sessionLibPath: this.#session.libPath,
+      extraReadOnlyPaths: this.#extraReadOnlyPaths,
     });
 
     const scriptPath = join(this.#session.dir, "__prelude_v2.ts");

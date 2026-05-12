@@ -334,3 +334,22 @@ Deno.test("cross-session isolation: two sessions don't share lib/storage", async
     }
   });
 });
+
+Deno.test("containerDir override: workspace lives under <root>/<container>/<id>", async () => {
+  await withTempRoot(async (root) => {
+    const s = await SessionStore.open({
+      sessionId: "watch1",
+      rootDir: root,
+      containerDir: "dreams",
+      sizeCaps: DEFAULT_SIZE_CAPS,
+    });
+    try {
+      const dir = join(root, "dreams", "watch1");
+      assertEquals(s.dir, dir);
+      assertEquals(await Deno.readTextFile(join(dir, "lib.ts")), "export {};\n");
+      assertEquals(await Deno.readTextFile(join(dir, "storage.json")), "{}\n");
+    } finally {
+      await s.close();
+    }
+  });
+});

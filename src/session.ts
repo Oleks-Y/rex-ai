@@ -27,8 +27,16 @@ const enc = new TextEncoder();
 export interface OpenOptions {
   /** Persistent session id. Omit to generate ephemeral. */
   sessionId?: string;
-  /** Where `sessions/<id>/` lives. Default: `<cwd>/.rex`. */
+  /** Where `<containerDir>/<id>/` lives. Default: `<cwd>/.rex`. */
   rootDir?: string;
+  /** Name of the container directory under `rootDir` that holds session
+   *  ids. Default `"sessions"` (yielding `<rootDir>/sessions/<id>/`).
+   *  The dreaming-agents subsystem overrides this to `"dreams"` so a
+   *  dreamer's workspace sits at
+   *  `.rex/sessions/<parent>/dreams/<name>/` — same SessionStore
+   *  invariants (lock, atomic writes, size caps, transcript), different
+   *  on-disk location. */
+  containerDir?: string;
   sizeCaps: SizeCaps;
 }
 
@@ -65,7 +73,8 @@ export class SessionStore {
     const ephemeral = opts.sessionId === undefined;
     const sessionId = opts.sessionId ?? generateEphemeralId();
     const root = opts.rootDir ?? join(Deno.cwd(), ".rex");
-    const dir = join(root, "sessions", sessionId);
+    const container = opts.containerDir ?? "sessions";
+    const dir = join(root, container, sessionId);
 
     await ensureDir(dir);
 
