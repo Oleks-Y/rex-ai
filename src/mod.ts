@@ -1,4 +1,18 @@
 export { Agent } from "./agent.ts";
+export {
+  defineDreamer,
+  dreamerMatches,
+  dreamerTriggerKind,
+} from "./dreamer.ts";
+export type {
+  DreamDropReason,
+  DreamerBackpressure,
+  DreamerDefinition,
+  DreamerTrigger,
+  DreamLifecycleEvent,
+  DreamPayload,
+  DreamUserInput,
+} from "./dreamer.ts";
 export { defineTool } from "./tools.ts";
 export {
   buildAuditLog,

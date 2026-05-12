@@ -6,6 +6,10 @@
 
 import type { LanguageModelV2 } from "@ai-sdk/provider";
 import type { z } from "zod";
+import type {
+  DreamerDefinition,
+  DreamLifecycleEvent,
+} from "./dreamer.ts";
 import type { GuardrailDefinition, GuardrailEvaluation } from "./guardrail.ts";
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -192,6 +196,47 @@ export interface AgentOptions {
     evaluation: GuardrailEvaluation,
     stepIndex: number,
   ) => void;
+  /**
+   * Dreaming agents — side-channel observer agents attached to this run.
+   * Each fires on a configurable subset of trigger events (same trigger
+   * model as guardrails), runs in its own sandboxed `Agent` with a
+   * read-only view of the parent's session directory, and writes its
+   * own outputs to `.rex/sessions/<id>/dreams/<name>/`. Use
+   * `defineDreamer()` to build one. Non-blocking — a dreamer cannot
+   * veto the parent's event.
+   *
+   * See `docs/plans/dreaming-agents.md`.
+   */
+  dreamers?: DreamerDefinition[];
+  /**
+   * Optional observability hook fired on every dreamer lifecycle
+   * transition (`fired` / `started` / `finished` / `dropped`). Useful
+   * for surfacing dreamer activity in a CLI / UI without parsing the
+   * per-dreamer `dream.jsonl`. Host callback errors are swallowed.
+   */
+  onDream?: (event: DreamLifecycleEvent) => void;
+  /**
+   * When true, the parent's `Agent.run()` / session close waits for all
+   * in-flight + queued dreamer fires to drain before resolving. Default
+   * false (queued fires are cancelled, in-flight fires are best-effort
+   * awaited but not blocked on).
+   *
+   * Set true when dreamer outputs are part of the run's contract (e.g.
+   * a ticket-creation dreamer whose reply is the artifact the caller
+   * actually wanted). Set false (default) when dreamers are pure
+   * observation and a fast parent exit matters more than the last few
+   * dream cycles.
+   */
+  awaitDreamsOnClose?: boolean;
+  /**
+   * Internal — not part of the public surface. Extra read-only paths
+   * spliced into the sandbox's `--allow-read` flag. Used exclusively by
+   * the dreaming-agents subsystem to mount a parent session dir
+   * read-only on a dreamer's sandbox. Direct callers should leave this
+   * unset; pass `permissions.read` instead.
+   * @internal
+   */
+  extraReadOnlyPaths?: string[];
 }
 
 export type RunResult =
