@@ -37,7 +37,7 @@ import {
   type SizeCaps,
   type ToolDefinition,
 } from "./types.ts";
-import { isAbsolute, normalize, relative, resolve } from "@std/path";
+import { isAbsolute, join, normalize, relative, resolve } from "@std/path";
 
 /** Triggers a dreamer can subscribe to. Strict superset of
  *  `GuardrailTrigger` — the sandbox-event kinds are identical, plus two
@@ -376,7 +376,7 @@ export class DreamPool {
         const worker = await DreamWorker.open({
           def,
           parentSession: input.parentSession,
-          emit: (ev) => emitLifecycle(input.onDream, ev),
+          onDream: input.onDream,
         });
         workers.set(def.name, worker);
         opened.push(worker);
@@ -435,7 +435,9 @@ export class DreamPool {
 interface DreamWorkerOpenInput {
   def: DreamerDefinition;
   parentSession: SessionStore;
-  emit: (event: DreamLifecycleEvent) => void;
+  /** Host-level lifecycle callback. The worker fans every emit out to
+   *  this AND to its own `dream.jsonl` writer. */
+  onDream?: (event: DreamLifecycleEvent) => void;
 }
 
 /** Owns one dreamer's Agent + queue. Public surface is `enqueue` and
@@ -445,6 +447,10 @@ export class DreamWorker {
   readonly #parentDir: string;
   readonly #session: SessionStore;
   readonly #agent: Agent;
+  readonly #onDream: ((event: DreamLifecycleEvent) => void) | undefined;
+  readonly #jsonlWriter: DreamJsonlWriter;
+  /** Combined emit: writes to `dream.jsonl` + fans to the host's
+   *  `onDream` callback. Each lifecycle transition flows through here. */
   readonly #emit: (event: DreamLifecycleEvent) => void;
   readonly #queue: DreamPayload[] = [];
   /** Payload IDs assigned per enqueue. Stable across logs so lifecycle
@@ -466,13 +472,22 @@ export class DreamWorker {
     parentDir: string;
     session: SessionStore;
     agent: Agent;
-    emit: (event: DreamLifecycleEvent) => void;
+    onDream: ((event: DreamLifecycleEvent) => void) | undefined;
+    jsonlWriter: DreamJsonlWriter;
   }) {
     this.definition = args.definition;
     this.#parentDir = args.parentDir;
     this.#session = args.session;
     this.#agent = args.agent;
-    this.#emit = args.emit;
+    this.#onDream = args.onDream;
+    this.#jsonlWriter = args.jsonlWriter;
+    this.#emit = (ev) => {
+      // Writer first — disk persistence is the contract a debugger leans
+      // on. If a host's onDream throws we still want the row on disk.
+      // The writer itself swallows IO errors so this is non-fatal.
+      this.#jsonlWriter.append(ev);
+      emitLifecycle(this.#onDream, ev);
+    };
   }
 
   static async open(input: DreamWorkerOpenInput): Promise<DreamWorker> {
@@ -496,29 +511,33 @@ export class DreamWorker {
     // injected into the long-lived AgentSession). The parent dir is
     // mounted readonly via extraReadOnlyPaths; the dreamer's own session
     // dir is already covered by PermissionCompiler's auto-include.
+    //
+    // sessionsContainerDir = "dreams" so the Agent's own SessionStore
+    // lands at <parent>/dreams/<name>/ — matches our scout SessionStore
+    // above, so the lock + state hand off cleanly.
     const agent = new Agent({
       model: def.model,
       task: def.task,
       tools: def.tools,
       permissions: def.permissions,
       sessionId: def.name,
-      sessionsRoot: parentSession.dir, // root for the dreamer's own SessionStore
-      // The Agent will re-open SessionStore with the same id + root we
-      // already used above. SessionStore.open is idempotent w.r.t. the
-      // directory but NOT the lock — we have to release our scout lock
-      // before the Agent opens its own. See close() for the inverse.
+      sessionsRoot: parentSession.dir,
+      sessionsContainerDir: "dreams",
       maxSteps: def.maxStepsPerFire ?? 4,
       sizeCaps,
       experimental: { asyncWakeups: true },
       extraReadOnlyPaths: [parentSession.dir],
     });
 
+    const jsonlWriter = new DreamJsonlWriter(join(session.dir, "dream.jsonl"));
+
     return new DreamWorker({
       definition: def,
       parentDir: parentSession.dir,
       session,
       agent,
-      emit: input.emit,
+      onDream: input.onDream,
+      jsonlWriter,
     });
   }
 
@@ -677,6 +696,62 @@ export class DreamWorker {
       // We opened the scout SessionStore but never handed off to the
       // Agent. Release the scout lock so the workspace is reusable.
       try { await this.#session.close(); } catch { /* */ }
+    }
+    try { await this.#jsonlWriter.close(); } catch { /* */ }
+  }
+}
+
+/** Append-only writer for the per-dreamer `dream.jsonl` index.
+ *
+ *  Each lifecycle transition becomes one JSON line. The writer
+ *  serializes IO through a single Promise chain so concurrent emits
+ *  can't interleave bytes. IO errors are non-fatal — the writer logs
+ *  once to stderr and then silently retries; the dreamer's lifecycle
+ *  is not blocked on disk health.
+ *
+ *  Exported for tests + ad-hoc readers that want to format
+ *  `dream.jsonl` entries the same way the runtime writes them. */
+export class DreamJsonlWriter {
+  readonly #path: string;
+  #chain: Promise<void> = Promise.resolve();
+  #closed = false;
+  #errorReported = false;
+
+  constructor(path: string) {
+    this.#path = path;
+  }
+
+  /** Synchronous enqueue; actual write happens on the chain. */
+  append(event: DreamLifecycleEvent): void {
+    if (this.#closed) return;
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      ...event,
+    }) + "\n";
+    this.#chain = this.#chain.then(() => this.#write(line));
+  }
+
+  /** Wait for in-flight writes to flush, then mark closed. */
+  async close(): Promise<void> {
+    if (this.#closed) return;
+    this.#closed = true;
+    try { await this.#chain; } catch { /* */ }
+  }
+
+  async #write(line: string): Promise<void> {
+    try {
+      await Deno.writeTextFile(this.#path, line, { append: true });
+    } catch (e) {
+      if (!this.#errorReported) {
+        this.#errorReported = true;
+        try {
+          Deno.stderr.writeSync(
+            new TextEncoder().encode(
+              `[rex] dream.jsonl write failed (${(e as Error).message}); further errors silenced\n`,
+            ),
+          );
+        } catch { /* */ }
+      }
     }
   }
 }

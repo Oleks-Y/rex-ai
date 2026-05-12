@@ -100,6 +100,9 @@ interface OpenInput {
   /** Extra read-only paths spliced into the sandbox's --allow-read.
    *  Dreamer-only; every other caller leaves this unset. */
   extraReadOnlyPaths?: string[];
+  /** Internal SessionStore container override; see
+   *  `AgentOptions.sessionsContainerDir`. */
+  sessionsContainerDir?: string;
 }
 
 export class AgentSessionImpl implements AgentSession {
@@ -203,6 +206,7 @@ export class AgentSessionImpl implements AgentSession {
     const session = await SessionStore.open({
       sessionId: input.sessionId,
       rootDir: input.sessionsRoot,
+      containerDir: input.sessionsContainerDir,
       sizeCaps: input.sizeCaps,
     });
 

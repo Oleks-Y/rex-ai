@@ -143,6 +143,7 @@ export class Agent {
       onDream: this.#opts.onDream,
       awaitDreamsOnClose: this.#opts.awaitDreamsOnClose === true,
       extraReadOnlyPaths: this.#opts.extraReadOnlyPaths,
+      sessionsContainerDir: this.#opts.sessionsContainerDir,
     });
   }
 
@@ -185,6 +186,7 @@ export class Agent {
     const session = await SessionStore.open({
       sessionId: this.#opts.sessionId,
       rootDir: this.#opts.sessionsRoot,
+      containerDir: this.#opts.sessionsContainerDir,
       sizeCaps: this.#sizeCaps,
     });
 

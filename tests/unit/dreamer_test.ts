@@ -3,10 +3,12 @@
 // integration tests once it lands.
 
 import { assertEquals, assertStringIncludes, assertThrows } from "@std/assert";
+import { join } from "@std/path";
 import type { LanguageModelV2 } from "@ai-sdk/provider";
 import {
   applyBackpressure,
   defineDreamer,
+  DreamJsonlWriter,
   dreamerMatches,
   dreamerTriggerKind,
   type DreamerDefinition,
@@ -401,6 +403,82 @@ Deno.test("renderPayloadAsUserMessage: collapses code-free / completion-free fir
 });
 
 // ── coalesce userInput merging ─────────────────────────────────────────
+
+// ── DreamJsonlWriter ─────────────────────────────────────────────────
+
+async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const dir = await Deno.makeTempDir({ prefix: "rex-dream-writer-" });
+  try { return await fn(dir); } finally {
+    try { await Deno.remove(dir, { recursive: true }); } catch { /* */ }
+  }
+}
+
+async function readJsonl(path: string): Promise<unknown[]> {
+  const text = await Deno.readTextFile(path);
+  return text.split("\n").filter((l) => l.length > 0).map((l) => JSON.parse(l));
+}
+
+Deno.test("DreamJsonlWriter: appends one JSON line per lifecycle event", async () => {
+  await withTempDir(async (dir) => {
+    const path = join(dir, "dream.jsonl");
+    const w = new DreamJsonlWriter(path);
+    w.append({ kind: "fired", dreamer: "d1", triggerKind: "reply", stepIndex: 1, payloadId: "d1#1" });
+    w.append({ kind: "started", dreamer: "d1", payloadId: "d1#1" });
+    w.append({
+      kind: "finished",
+      dreamer: "d1",
+      payloadId: "d1#1",
+      ok: true,
+      reply: "ok",
+      durationMs: 12,
+      steps: 1,
+    });
+    await w.close();
+
+    const rows = await readJsonl(path) as Array<Record<string, unknown>>;
+    assertEquals(rows.length, 3);
+    assertEquals(rows[0].kind, "fired");
+    assertEquals(rows[1].kind, "started");
+    assertEquals(rows[2].kind, "finished");
+    // Every row has an ISO timestamp.
+    for (const r of rows) assertEquals(typeof r.ts, "string");
+    assertEquals(rows[2].reply, "ok");
+  });
+});
+
+Deno.test("DreamJsonlWriter: preserves write order under concurrent appends", async () => {
+  await withTempDir(async (dir) => {
+    const path = join(dir, "dream.jsonl");
+    const w = new DreamJsonlWriter(path);
+    for (let i = 0; i < 50; i++) {
+      w.append({
+        kind: "fired",
+        dreamer: "d",
+        triggerKind: "reply",
+        stepIndex: i,
+        payloadId: `d#${i}`,
+      });
+    }
+    await w.close();
+    const rows = await readJsonl(path) as Array<Record<string, unknown>>;
+    assertEquals(rows.length, 50);
+    for (let i = 0; i < 50; i++) {
+      assertEquals(rows[i].stepIndex, i);
+    }
+  });
+});
+
+Deno.test("DreamJsonlWriter: append after close is a no-op", async () => {
+  await withTempDir(async (dir) => {
+    const path = join(dir, "dream.jsonl");
+    const w = new DreamJsonlWriter(path);
+    w.append({ kind: "fired", dreamer: "d", triggerKind: "reply", stepIndex: 1, payloadId: "d#1" });
+    await w.close();
+    w.append({ kind: "started", dreamer: "d", payloadId: "d#1" });
+    const rows = await readJsonl(path);
+    assertEquals(rows.length, 1);
+  });
+});
 
 Deno.test("coalesce: merged payload preserves union of userInputs (dedup)", () => {
   const h = harness({ ...VALID, backpressure: "coalesce" });

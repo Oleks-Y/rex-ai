@@ -136,6 +136,13 @@ export interface AgentOptions {
   sizeCaps?: Partial<SizeCaps>;
   /** Root for `.rex/sessions/<id>/`. Defaults to cwd. */
   sessionsRoot?: string;
+  /** Internal — name of the container directory under `sessionsRoot`
+   *  that holds session ids. Default `"sessions"`. The dreaming-agents
+   *  runtime overrides this to `"dreams"` so a dreamer's Agent lands
+   *  at `<parent>/dreams/<name>/` while reusing all SessionStore
+   *  invariants. Not part of the public surface.
+   *  @internal */
+  sessionsContainerDir?: string;
   /**
    * If true, replays `transcript.jsonl` as priorSteps when resuming a
    * session. Default false (state persists, history doesn't — original

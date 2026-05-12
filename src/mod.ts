@@ -2,6 +2,7 @@ export { Agent } from "./agent.ts";
 export {
   applyBackpressure,
   defineDreamer,
+  DreamJsonlWriter,
   DreamPool,
   DreamWorker,
   dreamerMatches,
