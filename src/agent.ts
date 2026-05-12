@@ -25,6 +25,11 @@
 
 import { generateText } from "ai";
 import { AgentSessionImpl } from "./agent_session.ts";
+import {
+  DreamPool,
+  type DreamerDefinition,
+  type DreamPayload,
+} from "./dreamer.ts";
 import { CodeExtractor, noCodeBlockEvent } from "./extractor.ts";
 import {
   type GuardrailDefinition,
@@ -79,6 +84,7 @@ export class Agent {
   readonly #maxSteps: number;
   readonly #forceFinalReply: boolean;
   readonly #guardrails: GuardrailDefinition[];
+  readonly #dreamers: DreamerDefinition[];
 
   constructor(opts: AgentOptions) {
     if (typeof opts.task !== "string" || opts.task.length === 0) {
@@ -101,6 +107,7 @@ export class Agent {
     // behavior mid-run. Names need not be unique — multiple guardrails
     // with the same name are legal (different models, different prompts).
     this.#guardrails = [...(opts.guardrails ?? [])];
+    this.#dreamers = [...(opts.dreamers ?? [])];
   }
 
   /**
@@ -132,6 +139,9 @@ export class Agent {
       forceFinalReply: this.#forceFinalReply,
       guardrails: this.#guardrails,
       onGuardrail: this.#opts.onGuardrail,
+      dreamers: this.#dreamers,
+      onDream: this.#opts.onDream,
+      awaitDreamsOnClose: this.#opts.awaitDreamsOnClose === true,
       extraReadOnlyPaths: this.#opts.extraReadOnlyPaths,
     });
   }
@@ -178,6 +188,29 @@ export class Agent {
       sizeCaps: this.#sizeCaps,
     });
 
+    // DreamPool lifetime is bounded by this run. It opens after the
+    // parent SessionStore (so the parent dir exists for the readonly
+    // mount) and closes before the parent session closes (so the
+    // dreamer's own SessionStore inside <parent>/dreams/ releases its
+    // lock first). Cleanup is in `finally` to handle abort paths.
+    let dreamPool: DreamPool | null = null;
+    if (this.#dreamers.length > 0) {
+      try {
+        dreamPool = await DreamPool.open({
+          parentSession: session,
+          dreamers: this.#dreamers,
+          onDream: this.#opts.onDream,
+        });
+      } catch (e) {
+        // A failure here is a configuration error — don't proceed with
+        // half-attached dreamers, abort the run cleanly so the caller
+        // sees the exact reason.
+        try { await session.close(); } catch { /* */ }
+        throw e;
+      }
+    }
+    this.#activeDreamPool = dreamPool;
+
     try {
       const state: LoopState = {
         priorSteps: [],
@@ -202,9 +235,26 @@ export class Agent {
       // when it hits the cap, so this branch is currently defensive.)
       return state.terminal ?? { kind: "exhausted", steps: state.freshStepCount };
     } finally {
+      // Close dreamers BEFORE the parent session — the dreamer's own
+      // SessionStore lives under the parent dir, so closing the parent
+      // first would leave the dreamer's lock orphaned.
+      if (dreamPool) {
+        try {
+          await dreamPool.close({
+            awaitDrain: this.#opts.awaitDreamsOnClose === true,
+          });
+        } catch { /* dreamer cleanup errors are non-fatal */ }
+      }
+      this.#activeDreamPool = null;
       await session.close();
     }
   }
+
+  /** Active DreamPool for the current run. Used by `#applyGuardrails`
+   *  to dispatch post-guardrail events without threading the pool
+   *  through every method. Cleared in `finally` so a follow-up run
+   *  can't fan out to a closed pool. */
+  #activeDreamPool: DreamPool | null = null;
 
   /** Drives the inner sandbox-step loop for a single event. Stops when a
    *  step returns a terminal frame OR the per-turn `maxSteps` cap is hit.
@@ -286,6 +336,7 @@ export class Agent {
         ev.task,
         state.priorSteps,
       );
+      this.#dispatchToDreamers(event, code, completion.text, stepIndex, ev.task);
       return await this.#recordStep(session, state, stepIndex, code, event);
     }
 
@@ -315,7 +366,39 @@ export class Agent {
       state.priorSteps,
     );
 
+    // Dreamer fanout sits BETWEEN guardrail evaluation and `#recordStep`
+    // so dreamers see post-guardrail events (matches plan §3). The call
+    // is sync-enqueue + fire-and-forget; the parent loop never waits.
+    this.#dispatchToDreamers(event, code, completion.text, stepIndex, ev.task);
+
     return await this.#recordStep(session, state, stepIndex, code, event);
+  }
+
+  /** Build a `DreamPayload` and dispatch it to the active DreamPool.
+   *  No-op when no pool is open or no dreamers match. Synchronous —
+   *  the worker LLM call happens out-of-band on its own task. */
+  #dispatchToDreamers(
+    event: SandboxEvent,
+    code: string,
+    llmCompletion: string,
+    stepIndex: number,
+    task: string,
+  ): void {
+    const pool = this.#activeDreamPool;
+    if (!pool) return;
+    const payload: DreamPayload = {
+      event,
+      llmCompletion,
+      code,
+      stepIndex,
+      task,
+      // Per-step Agent has only one user input (the initial task), no
+      // subsequent user_message turns. Turn is always 1.
+      userInputs: [{ kind: "task", content: task, turn: 1 }],
+      turn: 1,
+    };
+    if (!pool.hasMatch(payload)) return;
+    pool.dispatch(payload);
   }
 
   /** Append the step to the transcript, fire `onStep`, and return either a

@@ -399,3 +399,29 @@ Deno.test("renderPayloadAsUserMessage: collapses code-free / completion-free fir
   assertEquals(out.includes("Parent LLM completion (raw)"), false);
   assertEquals(out.includes("Parent code (extracted)"), false);
 });
+
+// ── coalesce userInput merging ─────────────────────────────────────────
+
+Deno.test("coalesce: merged payload preserves union of userInputs (dedup)", () => {
+  const h = harness({ ...VALID, backpressure: "coalesce" });
+  const a: DreamPayload = {
+    ...mkPayload("a", "reply"),
+    userInputs: [
+      { kind: "task", content: "t1", turn: 1 },
+      { kind: "message", content: "m1", turn: 1 },
+    ],
+  };
+  const b: DreamPayload = {
+    ...mkPayload("b", "reply"),
+    userInputs: [
+      { kind: "message", content: "m1", turn: 1 }, // dup
+      { kind: "message", content: "m2", turn: 1 },
+    ],
+  };
+  h.enqueue(a, { running: true });
+  h.enqueue(b, { running: true });   // coalesced into a
+  assertEquals(h.queue.length, 1);
+  assertEquals(h.queue[0].userInputs.length, 3); // t1, m1 (deduped), m2
+  const contents = h.queue[0].userInputs.map((u) => u.content);
+  assertEquals(contents, ["t1", "m1", "m2"]);
+});

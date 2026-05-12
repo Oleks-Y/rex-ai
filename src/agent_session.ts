@@ -23,6 +23,13 @@
 
 import { generateText } from "ai";
 import type { LanguageModelV2 } from "@ai-sdk/provider";
+import {
+  DreamPool,
+  type DreamerDefinition,
+  type DreamLifecycleEvent,
+  type DreamPayload,
+  type DreamUserInput,
+} from "./dreamer.ts";
 import { CodeExtractor, noCodeBlockEvent } from "./extractor.ts";
 import {
   type GuardrailDefinition,
@@ -84,6 +91,12 @@ interface OpenInput {
   forceFinalReply?: boolean;
   guardrails?: GuardrailDefinition[];
   onGuardrail?: (evaluation: GuardrailEvaluation, stepIndex: number) => void;
+  /** Dreamers attached to this session. Same semantics as
+   *  `AgentOptions.dreamers`; the AgentSession threads them through to
+   *  the DreamPool it owns for the lifetime of the session. */
+  dreamers?: DreamerDefinition[];
+  onDream?: (event: DreamLifecycleEvent) => void;
+  awaitDreamsOnClose?: boolean;
   /** Extra read-only paths spliced into the sandbox's --allow-read.
    *  Dreamer-only; every other caller leaves this unset. */
   extraReadOnlyPaths?: string[];
@@ -107,6 +120,10 @@ export class AgentSessionImpl implements AgentSession {
 
   readonly #session: SessionStore;
   readonly #sandbox: PersistentSandbox;
+  #dreamPool: DreamPool | null = null;
+  readonly #dreamers: DreamerDefinition[];
+  readonly #onDream?: (event: DreamLifecycleEvent) => void;
+  readonly #awaitDreamsOnClose: boolean;
 
   readonly #inbox: AsyncQueueInternal<LoopEvent>;
   readonly #outbox: AsyncQueueInternal<AgentEvent>;
@@ -120,6 +137,13 @@ export class AgentSessionImpl implements AgentSession {
    *  prompt's task framing — the model still needs to know what the
    *  user originally asked for. */
   #lastUserTask: string;
+  /** Accumulated user inputs for the current turn. Reset each time
+   *  `#processEvent` runs (turn boundary). Populated by the initial
+   *  user_task, follow-up user_message events, and used by the dreamer
+   *  fanout to give dreamers the conversation context the user
+   *  promised them ("only what's coming from the hook and main LLM
+   *  responses and user input"). */
+  #turnUserInputs: DreamUserInput[] = [];
 
   #closed = false;
   #closeResult: Promise<void> | null = null;
@@ -148,6 +172,9 @@ export class AgentSessionImpl implements AgentSession {
     forceFinalReply: boolean;
     guardrails: GuardrailDefinition[];
     onGuardrail?: (evaluation: GuardrailEvaluation, stepIndex: number) => void;
+    dreamers: DreamerDefinition[];
+    onDream?: (event: DreamLifecycleEvent) => void;
+    awaitDreamsOnClose: boolean;
   }) {
     this.#model = args.model;
     this.#tools = args.tools;
@@ -162,6 +189,9 @@ export class AgentSessionImpl implements AgentSession {
     this.#forceFinalReply = args.forceFinalReply;
     this.#guardrails = args.guardrails;
     this.#onGuardrail = args.onGuardrail;
+    this.#dreamers = args.dreamers;
+    this.#onDream = args.onDream;
+    this.#awaitDreamsOnClose = args.awaitDreamsOnClose;
     this.#inbox = new AsyncQueueInternal<LoopEvent>();
     this.#outbox = new AsyncQueueInternal<AgentEvent>();
     this.events = this.#outbox;
@@ -226,7 +256,28 @@ export class AgentSessionImpl implements AgentSession {
       forceFinalReply: input.forceFinalReply ?? true,
       guardrails: [...(input.guardrails ?? [])],
       onGuardrail: input.onGuardrail,
+      dreamers: [...(input.dreamers ?? [])],
+      onDream: input.onDream,
+      awaitDreamsOnClose: input.awaitDreamsOnClose === true,
     });
+
+    // Open the DreamPool once the parent session is established (so its
+    // dir exists for the readonly mount) but before the worker starts
+    // consuming events — that way the first turn can already fan out to
+    // dreamers. Failure here releases both the sandbox and session lock.
+    if (impl.#dreamers.length > 0) {
+      try {
+        impl.#dreamPool = await DreamPool.open({
+          parentSession: session,
+          dreamers: impl.#dreamers,
+          onDream: impl.#onDream,
+        });
+      } catch (e) {
+        try { await sandbox.close(); } catch { /* */ }
+        try { await session.close(); } catch { /* */ }
+        throw e;
+      }
+    }
 
     // Replay (if requested) BEFORE the worker starts. A failure here
     // leaves nothing in flight, but we still need to release the
@@ -236,6 +287,9 @@ export class AgentSessionImpl implements AgentSession {
         await impl.#replayTranscript();
       }
     } catch (e) {
+      if (impl.#dreamPool) {
+        try { await impl.#dreamPool.close({ awaitDrain: false }); } catch { /* */ }
+      }
       try { await sandbox.close(); } catch { /* */ }
       try { await session.close(); } catch { /* */ }
       throw e;
@@ -340,6 +394,14 @@ export class AgentSessionImpl implements AgentSession {
       try {
         await this.#workerDone;
       } catch { /* worker errors are surfaced via events; ignore here */ }
+      // Close dreamers BEFORE the parent session — their SessionStores
+      // live under the parent dir, so the parent must outlive them.
+      if (this.#dreamPool) {
+        try {
+          await this.#dreamPool.close({ awaitDrain: this.#awaitDreamsOnClose });
+        } catch { /* dreamer cleanup is non-fatal */ }
+        this.#dreamPool = null;
+      }
       try {
         await this.#sandbox.close();
       } catch { /* */ }
@@ -382,6 +444,24 @@ export class AgentSessionImpl implements AgentSession {
     // Update last-seen user task; wakeup-driven turns reuse it.
     if (ev.kind === "user_task" || ev.kind === "user_message") {
       this.#lastUserTask = ev.kind === "user_task" ? ev.task : ev.content;
+      // Track inputs for the dreamer fanout. The user's plan is "only
+      // what's coming from the hook and main LLM responses and user
+      // input" — this is the user-input half.
+      this.#turnUserInputs.push({
+        kind: ev.kind === "user_task" ? "task" : "message",
+        content: ev.kind === "user_task" ? ev.task : ev.content,
+        turn,
+      });
+      // Fire the synthetic `user_message` trigger BEFORE generation
+      // starts, so a dreamer subscribed to "user_message" can capture
+      // the user's intent verbatim before the model has a chance to
+      // paraphrase it. user_task triggers the same kind on turn 1 too —
+      // a dreamer that wants only follow-ups can filter by turn.
+      this.#dispatchSyntheticToDreamers(
+        "user_message",
+        ev.kind === "user_task" ? ev.task : ev.content,
+        turn,
+      );
     }
 
     // For wakeup-driven turns, inject a synthetic prior step the next
@@ -428,15 +508,19 @@ export class AgentSessionImpl implements AgentSession {
         // option is enabled).
         const lastStep = this.#forceFinalReply &&
           stepsThisTurn === this.#maxSteps - 1;
-        const result = await this.#runOneStep(taskForPrompt, lastStep);
+        const result = await this.#runOneStep(taskForPrompt, lastStep, turn);
         stepsThisTurn++;
         this.#freshStepCount++;
         if (result.kind === "reply") {
           this.#emit({ kind: "reply", message: result.message, turn, cause });
+          this.#dispatchTurnEndToDreamers(result.message, "reply", turn);
+          this.#turnUserInputs = [];
           return;
         }
         if (result.kind === "abort") {
           this.#emit({ kind: "abort", error: result.error, turn, cause });
+          this.#dispatchTurnEndToDreamers(result.error, "abort", turn);
+          this.#turnUserInputs = [];
           return;
         }
         // If the step terminated because a parent-issued cancel_step
@@ -445,9 +529,19 @@ export class AgentSessionImpl implements AgentSession {
         // processed as its own turn, with the interrupt visible in
         // priorSteps. This is the only "non_terminal triggers turn end"
         // case.
-        if (result.kind === "non_terminal" && result.interruptedByUserMessage) return;
+        if (result.kind === "non_terminal" && result.interruptedByUserMessage) {
+          // Don't fire turn_end — the turn was preempted, not terminated.
+          // Userinputs stay; the preempting message will append.
+          return;
+        }
       }
       this.#emit({ kind: "exhausted", steps: this.#freshStepCount, turn, cause });
+      this.#dispatchTurnEndToDreamers(
+        `exhausted after ${this.#freshStepCount} steps`,
+        "exhausted",
+        turn,
+      );
+      this.#turnUserInputs = [];
     } catch (e) {
       this.#emit({
         kind: "abort",
@@ -455,10 +549,11 @@ export class AgentSessionImpl implements AgentSession {
         turn,
         cause,
       });
+      this.#turnUserInputs = [];
     }
   }
 
-  async #runOneStep(taskForPrompt: string, lastStep: boolean): Promise<
+  async #runOneStep(taskForPrompt: string, lastStep: boolean, turn: number): Promise<
     { kind: "reply"; message: string }
     | { kind: "abort"; error: string }
     | { kind: "non_terminal"; interruptedByUserMessage?: boolean }
@@ -505,6 +600,7 @@ export class AgentSessionImpl implements AgentSession {
         stepIndex,
         taskForPrompt,
       );
+      this.#dispatchToDreamers(event, code, completion.text, stepIndex, taskForPrompt, turn);
       return await this.#recordAndContinue(stepIndex, code, event);
     }
 
@@ -524,7 +620,74 @@ export class AgentSessionImpl implements AgentSession {
       taskForPrompt,
     );
 
+    // Dreamer fanout sits between guardrail eval and `recordAndContinue`
+    // so dreamers see post-guardrail events, mirroring the per-step path
+    // in agent.ts.
+    this.#dispatchToDreamers(event, code, completion.text, stepIndex, taskForPrompt, turn);
+
     return await this.#recordAndContinue(stepIndex, code, event);
+  }
+
+  #dispatchToDreamers(
+    event: SandboxEvent,
+    code: string,
+    llmCompletion: string,
+    stepIndex: number,
+    task: string,
+    turn: number,
+  ): void {
+    const pool = this.#dreamPool;
+    if (!pool) return;
+    const payload: DreamPayload = {
+      event,
+      llmCompletion,
+      code,
+      stepIndex,
+      task,
+      userInputs: [...this.#turnUserInputs],
+      turn,
+    };
+    if (!pool.hasMatch(payload)) return;
+    pool.dispatch(payload);
+  }
+
+  /** Fire a synthetic-trigger payload (`user_message` / `turn_end`). The
+   *  payload's `event` is a placeholder reflect-with-state describing
+   *  what happened; the dreamer's prompt knows the synthetic-trigger
+   *  shape via `renderPayloadAsUserMessage`. */
+  #dispatchSyntheticToDreamers(
+    kind: "user_message" | "turn_end",
+    content: string,
+    turn: number,
+    extra?: { terminalKind?: "reply" | "abort" | "exhausted" },
+  ): void {
+    const pool = this.#dreamPool;
+    if (!pool) return;
+    const synthState = kind === "user_message"
+      ? { __user_message: content }
+      : { __turn_end: content, terminal: extra?.terminalKind ?? "reply" };
+    const payload: DreamPayload = {
+      event: { kind: "reflect", state: synthState, logs: [] },
+      llmCompletion: "",
+      code: "",
+      stepIndex: this.#resumedCount + this.#freshStepCount + 1,
+      task: this.#lastUserTask,
+      userInputs: [...this.#turnUserInputs],
+      turn,
+      syntheticTrigger: kind,
+    };
+    if (!pool.hasMatch(payload)) return;
+    pool.dispatch(payload);
+  }
+
+  /** Fire the `turn_end` synthetic trigger. Called from the turn loop
+   *  on every terminal outcome (reply / abort / exhausted). */
+  #dispatchTurnEndToDreamers(
+    summary: string,
+    terminalKind: "reply" | "abort" | "exhausted",
+    turn: number,
+  ): void {
+    this.#dispatchSyntheticToDreamers("turn_end", summary, turn, { terminalKind });
   }
 
   /** Append the step to the transcript, fire `onStep` + outbox `step`
