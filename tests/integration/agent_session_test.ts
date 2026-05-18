@@ -249,24 +249,32 @@ Deno.test("openSession: double close is idempotent", async () => {
   });
 });
 
-Deno.test("openSession: extractor failure abort uses correct turn number", async () => {
-  // Model returns no code fence on the FIRST turn → NoCodeBlockError
-  // bubbles through the worker. Must surface as abort with turn: 1
-  // (not turn: 2 from a stray double-increment).
+Deno.test("openSession: missing code fence is recoverable — model retries next turn", async () => {
+  // Turn 1 step 1: no fence → synthetic `throw` step recorded.
+  // Turn 1 step 2: fenced reply → success.
+  // Asserts the agent surfaces the throw via a `step` event and then a
+  // `reply` event, instead of aborting the whole run.
   await withTempRoot(async (root) => {
+    let call = 0;
     const model: LanguageModelV2 = {
       specificationVersion: "v2",
       provider: "rex-mock",
       modelId: "rex-mock-1",
       supportedUrls: {},
-      doGenerate: () =>
-        Promise.resolve({
+      doGenerate: () => {
+        call++;
+        const text = call === 1
+          // First turn: bare text, no fence.
+          ? "I forgot to use a fence, sorry."
+          // Second turn: proper fenced code.
+          : '```ts\nawait reply("recovered");\n```';
+        return Promise.resolve({
           finishReason: "stop",
           usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 },
-          // No ts/typescript fence anywhere → extractor throws.
-          content: [{ type: "text", text: "no fence here, just words" }],
+          content: [{ type: "text", text }],
           warnings: [],
-        }),
+        });
+      },
       doStream: () => {
         throw new Error("not implemented");
       },
@@ -277,11 +285,23 @@ Deno.test("openSession: extractor failure abort uses correct turn number", async
       sessionsRoot: root,
       experimental: exp,
     }).openSession();
-    let abort: { turn: number; error: string } | null = null;
+
+    const stepKinds: string[] = [];
+    let throwError: string | null = null;
+    let reply: string | null = null;
+    let abort: string | null = null;
     try {
       for await (const ev of session.events) {
+        if (ev.kind === "step") {
+          stepKinds.push(ev.event.kind);
+          if (ev.event.kind === "throw") throwError = ev.event.error;
+        }
+        if (ev.kind === "reply") {
+          reply = ev.message;
+          break;
+        }
         if (ev.kind === "abort") {
-          abort = { turn: ev.turn, error: ev.error };
+          abort = ev.error;
           break;
         }
       }
@@ -289,8 +309,94 @@ Deno.test("openSession: extractor failure abort uses correct turn number", async
       await session.close();
       for await (const _ of session.events) { /* */ }
     }
-    assertEquals(abort?.turn, 1);
-    assertStringIncludes(abort!.error, "agent loop error");
+    assertEquals(abort, null, "must not abort on a missing fence");
+    assertEquals(reply, "recovered");
+    assertEquals(stepKinds, ["throw", "reply"]);
+    assertStringIncludes(throwError ?? "", "no ts/typescript code block");
+    // The error preview should echo the model's bad output back to it.
+    assertStringIncludes(throwError ?? "", "I forgot to use a fence");
+  });
+});
+
+Deno.test("openSession: forceFinalReply directive fires on last step (session path)", async () => {
+  // 3 reflects in a row, maxSteps=3. The persistent-session loop should
+  // mark the third step's prompt with the "LAST STEP" directive.
+  await withTempRoot(async (root) => {
+    const { model, prompts } = mockModel(['await reflect({ i: 0 });']);
+    const session = await new Agent({
+      model,
+      task: "x",
+      sessionsRoot: root,
+      maxSteps: 3,
+      experimental: exp,
+    }).openSession();
+
+    try {
+      for await (const ev of session.events) {
+        if (ev.kind === "exhausted" || ev.kind === "reply" || ev.kind === "abort") break;
+      }
+    } finally {
+      await session.close();
+      for await (const _ of session.events) { /* */ }
+    }
+    assertEquals(prompts.length, 3);
+    assertEquals(prompts[0].includes("LAST STEP"), false);
+    assertEquals(prompts[1].includes("LAST STEP"), false);
+    assertEquals(prompts[2].includes("LAST STEP"), true);
+  });
+});
+
+Deno.test("openSession: chronic missing fence eventually exhausts (not abort)", async () => {
+  // If the model never produces a fence, every step is a synthetic
+  // throw. `maxSteps` provides the cap and we get an `exhausted` event,
+  // not a runaway loop or an `abort`.
+  await withTempRoot(async (root) => {
+    const model: LanguageModelV2 = {
+      specificationVersion: "v2",
+      provider: "rex-mock",
+      modelId: "rex-mock-1",
+      supportedUrls: {},
+      doGenerate: () =>
+        Promise.resolve({
+          finishReason: "stop",
+          usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 },
+          content: [{ type: "text", text: "still no fence" }],
+          warnings: [],
+        }),
+      doStream: () => {
+        throw new Error("not implemented");
+      },
+    };
+    const session = await new Agent({
+      model,
+      task: "x",
+      sessionsRoot: root,
+      maxSteps: 3,
+      experimental: exp,
+    }).openSession();
+
+    const stepKinds: string[] = [];
+    let exhaustedSteps: number | null = null;
+    let abort: string | null = null;
+    try {
+      for await (const ev of session.events) {
+        if (ev.kind === "step") stepKinds.push(ev.event.kind);
+        if (ev.kind === "exhausted") {
+          exhaustedSteps = ev.steps;
+          break;
+        }
+        if (ev.kind === "abort") {
+          abort = ev.error;
+          break;
+        }
+      }
+    } finally {
+      await session.close();
+      for await (const _ of session.events) { /* */ }
+    }
+    assertEquals(abort, null);
+    assertEquals(exhaustedSteps, 3);
+    assertEquals(stepKinds, ["throw", "throw", "throw"]);
   });
 });
 

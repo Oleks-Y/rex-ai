@@ -49,7 +49,10 @@ class ToolError extends Error {
 class WriteLibError extends Error {
   constructor(message: string) { super(message); this.name = "WriteLibError"; }
 }
-class ToolResultTooLargeError extends Error {
+// Extends ToolError so a single catch(e instanceof ToolError) in agent code
+// handles validation failures AND oversize results. instanceof
+// ToolResultTooLargeError still works when the caller wants to discriminate.
+class ToolResultTooLargeError extends ToolError {
   constructor(message: string) { super(message); this.name = "ToolResultTooLargeError"; }
 }
 

@@ -490,6 +490,38 @@ Deno.test("oversize tool result → ToolResultTooLargeError in sandbox", async (
   });
 });
 
+Deno.test("oversize tool result also caught as ToolError (subclass)", async () => {
+  // ToolResultTooLargeError extends ToolError, so a single
+  // `catch (e) { if (e instanceof ToolError) }` in agent code handles
+  // both validation failures and oversize results uniformly.
+  await withSession(async (session) => {
+    const tools = new ToolRegistry([
+      defineTool({
+        name: "huge",
+        description: "",
+        schema: z.object({}),
+        handler: () => ({ blob: "x".repeat(2000) }),
+      }),
+    ]);
+    const r = await Sandbox.run({
+      llmCode: `
+        try {
+          await huge({});
+          await reply("did-not-throw");
+        } catch (e: any) {
+          await reply("isToolError:" + (e instanceof ToolError));
+        }
+      `,
+      tools,
+      session,
+      permissions: noPerms,
+      sizeCaps: { ...DEFAULT_SIZE_CAPS, toolResultBytes: 256 },
+    });
+    assertEquals(r.kind, "reply");
+    if (r.kind === "reply") assertEquals(r.message, "isToolError:true");
+  });
+});
+
 Deno.test("concurrent in-flight tool calls don't race the stdin writer", async () => {
   // Regression: the parent used to acquire `proc.stdin.getWriter()` per
   // frame; multiple simultaneous tool replies threw "stream is already

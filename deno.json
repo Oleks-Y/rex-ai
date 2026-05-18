@@ -13,7 +13,8 @@
     "eval:l1": "deno run --allow-read --allow-write --allow-run --allow-env --allow-net --allow-sys evals/runner.ts --layer l1",
     "eval:l2": "deno run --allow-read --allow-write --allow-run --allow-env --allow-net --allow-sys evals/bfcl/run.ts",
     "eval:all": "deno task eval:l1 && deno task eval:l2",
-    "eval:score": "deno run --allow-read --allow-write evals/score.ts"
+    "eval:score": "deno run --allow-read --allow-write evals/score.ts",
+    "example:chat-host": "deno run -A --config deno.json examples/nextjs/server.ts"
   },
   "imports": {
     "ai": "npm:ai@5",
