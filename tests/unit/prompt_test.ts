@@ -175,3 +175,62 @@ Deno.test("multiple tools rendered in registration order", () => {
   const bi = out.indexOf("b(args:");
   assertEquals(ai >= 0 && bi >= 0 && ai < bi, true);
 });
+
+Deno.test("lastStep: omitted by default — task is last, no directive", () => {
+  const out = PromptBuilder.build(baseInput({ task: "x" }));
+  assertEquals(out.endsWith("Task: x"), true);
+  assertEquals(out.includes("LAST STEP"), false);
+});
+
+Deno.test("lastStep: directive appended AFTER task, names reply()/abort()", () => {
+  const out = PromptBuilder.build(baseInput({ task: "x", lastStep: true }));
+  // Sits after the task block — the model reads it last.
+  const taskIdx = out.indexOf("Task: x");
+  const directiveIdx = out.indexOf("LAST STEP");
+  assertEquals(taskIdx >= 0 && directiveIdx > taskIdx, true);
+  // Names the only two acceptable terminals, by name.
+  assertStringIncludes(out, "return reply(");
+  assertStringIncludes(out, "return abort(");
+  // Names the failure mode the model is being warned against.
+  assertStringIncludes(out, "EXHAUSTED");
+});
+
+Deno.test("lastStep: explicit false renders no directive", () => {
+  const out = PromptBuilder.build(baseInput({ lastStep: false }));
+  assertEquals(out.includes("LAST STEP"), false);
+});
+
+Deno.test("header rules: forbids reply/abort inside timer callbacks", () => {
+  const out = PromptBuilder.build(baseInput());
+  assertStringIncludes(out, "Inside a timer callback");
+  assertStringIncludes(out, "reflect(value)");
+  // Silent callbacks remain legal — the rule must call this out so the
+  // predicate-poll pattern doesn't get nuked.
+  assertStringIncludes(out, "predicate-poll");
+});
+
+Deno.test("header rules: verify-before-reply warns about guardrail enforcement", () => {
+  const out = PromptBuilder.build(baseInput());
+  assertStringIncludes(out, "guardrail may enforce");
+});
+
+Deno.test("prior steps: guardrail_blocked event renders revise-and-retry directive", () => {
+  const out = PromptBuilder.build(baseInput({
+    priorSteps: [{
+      code: 'await reply("ugly word");',
+      event: {
+        kind: "guardrail_blocked",
+        guardrail: "no-profanity",
+        reason: "contains a banned word",
+        originalKind: "reply",
+        original: { kind: "reply", message: "ugly word" },
+        logs: [],
+      },
+    }],
+  }));
+  assertStringIncludes(out, "BLOCKED by guardrail 'no-profanity'");
+  assertStringIncludes(out, "contains a banned word");
+  assertStringIncludes(out, "previous reply was rejected");
+  assertStringIncludes(out, "Blocked payload: reply(ugly word)");
+  assertStringIncludes(out, "REVISE");
+});

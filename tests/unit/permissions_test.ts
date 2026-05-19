@@ -116,3 +116,55 @@ Deno.test("dedup in net entries", () => {
   const out = compile({ net: ["a.com", "a.com", "b.com"] });
   assertEquals(out.flags.find((f) => f.startsWith("--allow-net")), "--allow-net=a.com,b.com");
 });
+
+Deno.test("extraReadOnlyPaths: spliced into --allow-read after user paths", () => {
+  const out = PermissionCompiler.compile({
+    permissions: { read: ["./cache"] },
+    sessionDir: SESSION_DIR,
+    sessionLibPath: LIB_PATH,
+    extraReadOnlyPaths: [".rex/sessions/parent"],
+  });
+  assertEquals(
+    out.flags.find((f) => f.startsWith("--allow-read")),
+    `--allow-read=${SESSION_DIR},./cache,.rex/sessions/parent`,
+  );
+});
+
+Deno.test("extraReadOnlyPaths: dedupes against the session dir and user paths", () => {
+  const out = PermissionCompiler.compile({
+    permissions: { read: [".rex/sessions/parent"] },
+    sessionDir: SESSION_DIR,
+    sessionLibPath: LIB_PATH,
+    extraReadOnlyPaths: [".rex/sessions/parent", SESSION_DIR],
+  });
+  // session dir is always first; the dup should only appear once.
+  assertEquals(
+    out.flags.find((f) => f.startsWith("--allow-read")),
+    `--allow-read=${SESSION_DIR},.rex/sessions/parent`,
+  );
+});
+
+Deno.test("extraReadOnlyPaths: still rejects commas / control chars", () => {
+  assertThrows(
+    () =>
+      PermissionCompiler.compile({
+        permissions: undefined,
+        sessionDir: SESSION_DIR,
+        sessionLibPath: LIB_PATH,
+        extraReadOnlyPaths: ["a,b"],
+      }),
+    Error,
+    "comma not allowed",
+  );
+});
+
+Deno.test("extraReadOnlyPaths: empty / absent → no behavior change", () => {
+  const base = compile(undefined);
+  const empty = PermissionCompiler.compile({
+    permissions: undefined,
+    sessionDir: SESSION_DIR,
+    sessionLibPath: LIB_PATH,
+    extraReadOnlyPaths: [],
+  });
+  assertEquals(empty.flags, base.flags);
+});

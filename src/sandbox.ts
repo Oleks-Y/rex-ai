@@ -36,6 +36,10 @@ export interface RunInput {
   session: SessionStore;
   permissions: PermissionsConfig | undefined;
   sizeCaps: SizeCaps;
+  /** Extra read-only paths spliced into --allow-read. Used exclusively
+   *  by the dreaming-agents runtime to mount a parent session dir on a
+   *  dreamer's sandbox. Empty / absent on every other call site. */
+  extraReadOnlyPaths?: string[];
 }
 
 const PERMISSION_KINDS = new Set<PermissionKind>([
@@ -78,6 +82,7 @@ export const Sandbox = {
       permissions: input.permissions,
       sessionDir: input.session.dir,
       sessionLibPath: input.session.libPath,
+      extraReadOnlyPaths: input.extraReadOnlyPaths,
     });
 
     // 4. Write step script + import map into the session dir.

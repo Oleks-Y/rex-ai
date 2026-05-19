@@ -6,6 +6,11 @@
 
 import type { LanguageModelV2 } from "@ai-sdk/provider";
 import type { z } from "zod";
+import type {
+  DreamerDefinition,
+  DreamLifecycleEvent,
+} from "./dreamer.ts";
+import type { GuardrailDefinition, GuardrailEvaluation } from "./guardrail.ts";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Public surface (Agent options + result)
@@ -50,7 +55,29 @@ export interface SizeCaps {
   storageBytes: number;
   /** Per-step wall-clock cap in ms. Default 60_000. */
   stepTimeoutMs: number;
+  /** Wall-clock cap for awaiting a promise passed to `reflect(promise)`,
+   *  in ms. Independent of `stepTimeoutMs` because the whole point of
+   *  `reflect(promise)` is "I don't know how long this takes." Default
+   *  300_000 (5 min). */
+  reflectPromiseTimeoutMs: number;
+  /** Max bytes captured per fetch/fs response body before truncation.
+   *  Bodies larger than this are stored truncated to this many bytes
+   *  with `BlobRef.truncated = true`. Default 256 KiB. */
+  ioBodyBytes: number;
+  /** Max total IO-body bytes captured per step across all IO events.
+   *  Once this budget is exhausted, subsequent events in the same step
+   *  are recorded with metadata only (no `bodyRef`). Default 4 MiB. */
+  ioStepTotalBytes: number;
+  /** Header names to redact to `"<redacted>"` on capture (case-insensitive
+   *  match). Default: authorization, cookie, set-cookie, x-api-key. */
+  ioRedactHeaders: string[];
 }
+
+/** Sentinel placed in the `headers` map of an `IOEvent.fetch` request /
+ *  response when a header name matched `SizeCaps.ioRedactHeaders`. Kept
+ *  as a const so downstream readers can grep / compare without importing
+ *  the recorder. */
+export const IO_REDACTED_VALUE = "<redacted>";
 
 export const DEFAULT_SIZE_CAPS: SizeCaps = {
   logBytes: 64 * 1024,
@@ -59,6 +86,10 @@ export const DEFAULT_SIZE_CAPS: SizeCaps = {
   libBytes: 64 * 1024,
   storageBytes: 1024 * 1024,
   stepTimeoutMs: 60_000,
+  reflectPromiseTimeoutMs: 5 * 60_000,
+  ioBodyBytes: 256 * 1024,
+  ioStepTotalBytes: 4 * 1024 * 1024,
+  ioRedactHeaders: ["authorization", "cookie", "set-cookie", "x-api-key"],
 };
 
 export interface StepRecord {
@@ -68,15 +99,121 @@ export interface StepRecord {
   source: "fresh" | "resumed";
   code: string;
   event: SandboxEvent;
+  /** Side-effecting interactions the step performed (fetch, fs reads,
+   *  tool calls, lib writes) in temporal order. Populated for `"fresh"`
+   *  steps by the agent loop after step flush; absent on `"resumed"`
+   *  steps unless the resume path explicitly rehydrates from
+   *  `io.jsonl` (see docs/plans/extended-transcript §6). */
+  io?: IOEvent[];
 }
+
+/** Content-addressed reference to an IO body (request/response payload,
+ *  fs read bytes, tool args/result JSON). Bodies live under the session
+ *  directory at `path` — typically `blobs/<sha[0:2]>/<sha[2:4]>/<sha>`.
+ *  When `truncated` is true, the file holds only the first
+ *  `SizeCaps.ioBodyBytes` bytes of the original body, hashed *after*
+ *  truncation so the ref is reproducible. */
+export interface BlobRef {
+  /** SHA-256 of the bytes on disk (which may be a truncated prefix). */
+  sha256: string;
+  /** Path relative to the session directory, POSIX-style. */
+  path: string;
+  /** True when the on-disk body is a truncated prefix of the original. */
+  truncated: boolean;
+}
+
+/** One side-effecting interaction performed by a sandbox step. Ride-along
+ *  to `SandboxEvent` — the existing union stays byte-for-byte stable
+ *  (resume invariant), and dreamers / observers opt in by reading
+ *  `io.jsonl`. See docs/plans/extended-transcript.md for rationale. */
+export type IOEvent =
+  | {
+    kind: "fetch";
+    /** Per-step monotonic id assigned by the recorder. Lets a reader
+     *  pair a request with its response if the recorder ever splits
+     *  them into two frames. */
+    callId: string;
+    request: {
+      url: string;
+      method: string;
+      /** Headers AFTER redaction. Names listed in `SizeCaps.ioRedactHeaders`
+       *  appear with value `IO_REDACTED_VALUE`. */
+      headers: Record<string, string>;
+      /** Reference to the request body bytes. Absent when the request
+       *  had no body or the per-step body budget was exhausted before
+       *  this event was recorded. */
+      bodyRef?: BlobRef;
+      /** Original body size in bytes, BEFORE any truncation. 0 when
+       *  there was no body. */
+      bodyBytes: number;
+    };
+    response:
+      | {
+        status: number;
+        headers: Record<string, string>;
+        bodyRef?: BlobRef;
+        bodyBytes: number;
+        contentType?: string;
+      }
+      | { error: string };
+    durationMs: number;
+  }
+  | {
+    kind: "fs_read";
+    /** Absolute, post-resolve path the agent passed (or the resolved
+     *  path returned by the FS call, whichever the wrapper has
+     *  closest at the time of recording). */
+    path: string;
+    /** Which Deno read API the agent invoked — useful signal for
+     *  "you used `readTextFile` on a 4MB file when you only needed
+     *  the first line". */
+    api: "readTextFile" | "readFile" | "readDir" | "stat";
+    result:
+      | { ok: true; bytes: number; bodyRef?: BlobRef }
+      | { ok: true; entries: number }
+      | { ok: true; stat: Record<string, unknown> }
+      | { ok: false; error: string };
+    durationMs: number;
+  }
+  | {
+    kind: "tool_call";
+    callId: string;
+    name: string;
+    argsRef?: BlobRef;
+    argsBytes: number;
+    result:
+      | { ok: true; valueRef?: BlobRef; valueBytes: number }
+      | { ok: false; error: string };
+    durationMs: number;
+  }
+  | {
+    kind: "write_lib";
+    ok: boolean;
+    sourceBytes: number;
+    /** Present only on accepted writes. */
+    sourceRef?: BlobRef;
+    /** Present on rejection. */
+    error?: string;
+  };
+
+/** Lifecycle phase of a single in-flight sandbox step.
+ *
+ *  - `generating`: the LLM call (`generateText`) is in flight. The agent
+ *    is waiting on the model to produce code.
+ *  - `running`: the model returned and the sandbox is now executing the
+ *    extracted code.
+ *
+ *  Emitted via `AgentOptions.onPhase` so UIs (CLI spinner, IDE status
+ *  bar, etc.) can show which phase the agent is in without polling. */
+export type AgentPhase = "generating" | "running";
 
 export interface ExperimentalOptions {
   /**
    * Run all steps inside a single persistent Deno subprocess for the
    * lifetime of `Agent.run()`, instead of spawning a fresh subprocess
-   * per step. Required by later phases for `scheduleWakeup`, the tasks
-   * API, and the duplex `AgentSession` surface (not yet implemented as
-   * of step 2). Default false.
+   * per step. Required for the timer-based wakeup primitives
+   * (`setTimeout` / `setInterval` / `reflect(promise)`) and the duplex
+   * `AgentSession` surface. Default false.
    *
    * Behavior with this flag is intended to match the per-step path for
    * all currently-tested cases. Differences:
@@ -85,6 +222,19 @@ export interface ExperimentalOptions {
    *     by default.
    */
   asyncWakeups?: boolean;
+  /**
+   * If true, every fire of an intercepted `setTimeout` / `setInterval`
+   * callback automatically wakes the agent — the callback's return
+   * value becomes the synthetic prior step's reflect state. Default
+   * false: a callback only wakes the agent if it explicitly calls
+   * `reflect` (or `reply` / `abort`, which are translated to reflect).
+   *
+   * Useful for monitoring loops that should always surface their
+   * verdict; the default (silent) is better for cheap-predicate polls.
+   * The LLM uses native `setTimeout` / `setInterval` either way — this
+   * flag is a host-side policy, not exposed to the agent code.
+   */
+  autoWakeOnTimer?: boolean;
 }
 
 export interface AgentOptions {
@@ -101,6 +251,13 @@ export interface AgentOptions {
   sizeCaps?: Partial<SizeCaps>;
   /** Root for `.rex/sessions/<id>/`. Defaults to cwd. */
   sessionsRoot?: string;
+  /** Internal — name of the container directory under `sessionsRoot`
+   *  that holds session ids. Default `"sessions"`. The dreaming-agents
+   *  runtime overrides this to `"dreams"` so a dreamer's Agent lands
+   *  at `<parent>/dreams/<name>/` while reusing all SessionStore
+   *  invariants. Not part of the public surface.
+   *  @internal */
+  sessionsContainerDir?: string;
   /**
    * If true, replays `transcript.jsonl` as priorSteps when resuming a
    * session. Default false (state persists, history doesn't — original
@@ -113,8 +270,95 @@ export interface AgentOptions {
    * promise.
    */
   onStep?: (step: StepRecord) => void | Promise<void>;
+  /**
+   * Called before each fresh step transitions into a new phase
+   * (`generating` then `running`). Lets a UI surface "where" the agent
+   * is mid-step — useful for spinners that distinguish LLM latency from
+   * sandbox latency. Not called for replayed-from-transcript steps.
+   * Host callback errors are swallowed (this is observability only).
+   */
+  onPhase?: (phase: AgentPhase, stepIndex: number) => void;
+  /**
+   * When true (default), the prompt for the FINAL allowed step (the
+   * `maxSteps`-th one within a turn) carries an explicit directive
+   * telling the model it must `return reply(...)` or `return abort(...)`
+   * — anything else ends the turn as `exhausted` with no answer to the user.
+   *
+   * Helpful when an agent has otherwise been making progress via
+   * `reflect(...)` and would silently exhaust its step budget on the last
+   * turn. Set to false to keep the legacy behavior (no directive,
+   * exhaustion possible).
+   */
+  forceFinalReply?: boolean;
   /** Experimental, off by default. See `ExperimentalOptions`. */
   experimental?: ExperimentalOptions;
+  /**
+   * Guardrails — independent LLM checks that run on each sandbox step
+   * and may veto the event. Use `defineGuardrail()` to construct one.
+   * Each guardrail declares which event kinds it cares about and
+   * receives an audit log of the conversation when triggered. A
+   * blocking verdict replaces the original event with a non-terminal
+   * `guardrail_blocked` step tagged with the guardrail's name + reason
+   * and carrying the original payload; the agent loop pushes it to
+   * prior history and runs another step so the model can revise.
+   *
+   * Guardrails fire AFTER the sandbox produces an event but BEFORE it
+   * is written to the transcript or surfaced via `onStep`. The
+   * transcript / step record therefore reflects the post-guardrail
+   * event, so resume / replay sees the same thing the host did.
+   */
+  guardrails?: GuardrailDefinition[];
+  /**
+   * Optional observability hook called once per guardrail evaluation —
+   * including evaluations that allowed the event. Useful for surfacing
+   * guardrail activity in a CLI / UI without parsing the transcript.
+   * Host callback errors are swallowed.
+   */
+  onGuardrail?: (
+    evaluation: GuardrailEvaluation,
+    stepIndex: number,
+  ) => void;
+  /**
+   * Dreaming agents — side-channel observer agents attached to this run.
+   * Each fires on a configurable subset of trigger events (same trigger
+   * model as guardrails), runs in its own sandboxed `Agent` with a
+   * read-only view of the parent's session directory, and writes its
+   * own outputs to `.rex/sessions/<id>/dreams/<name>/`. Use
+   * `defineDreamer()` to build one. Non-blocking — a dreamer cannot
+   * veto the parent's event.
+   *
+   * See `docs/plans/dreaming-agents.md`.
+   */
+  dreamers?: DreamerDefinition[];
+  /**
+   * Optional observability hook fired on every dreamer lifecycle
+   * transition (`fired` / `started` / `finished` / `dropped`). Useful
+   * for surfacing dreamer activity in a CLI / UI without parsing the
+   * per-dreamer `dream.jsonl`. Host callback errors are swallowed.
+   */
+  onDream?: (event: DreamLifecycleEvent) => void;
+  /**
+   * When true, the parent's `Agent.run()` / session close waits for all
+   * in-flight + queued dreamer fires to drain before resolving. Default
+   * false (queued fires are cancelled, in-flight fires are best-effort
+   * awaited but not blocked on).
+   *
+   * Set true when dreamer outputs are part of the run's contract (e.g.
+   * a ticket-creation dreamer whose reply is the artifact the caller
+   * actually wanted). Set false (default) when dreamers are pure
+   * observation and a fast parent exit matters more than the last few
+   * dream cycles.
+   */
+  awaitDreamsOnClose?: boolean;
+  /**
+   * Internal — not part of the public surface. Extra read-only paths
+   * spliced into the sandbox's `--allow-read` flag. Used exclusively by
+   * the dreaming-agents subsystem to mount a parent session dir
+   * read-only on a dreamer's sandbox. Direct callers should leave this
+   * unset; pass `permissions.read` instead.
+   * @internal
+   */
+  extraReadOnlyPaths?: string[];
 }
 
 export type RunResult =
@@ -160,12 +404,30 @@ export type AgentEvent =
     kind: "wakeup_scheduled";
     id: string;
     reason: string;
-    wakeupKind: "delay" | "thunk" | "signal";
+    wakeupKind: WakeupKind;
+    /** Configured delay (ms) at registration time. Set for timer kinds
+     *  to the `ms` arg passed to `setTimeout` / `setInterval`. Omitted
+     *  for `promise` (no configured period). */
+    delayMs?: number;
   }
-  | { kind: "wakeup_resolved"; id: string }
+  | { kind: "wakeup_resolved"; id: string; payload?: WakeupResolvedPayload }
   | { kind: "wakeup_rejected"; id: string; error: string }
   | { kind: "wakeup_cancelled"; id: string; reason: string }
   | { kind: "session_closed"; reason: string };
+
+/** What kind of underlying primitive scheduled this wakeup. */
+export type WakeupKind = "timeout" | "interval" | "promise";
+
+/** Payload attached to a `wakeup_resolved` frame.
+ *  - `state`: a value reflected by the callback (or returned, when the
+ *    `autoWakeOnTimer` policy is on).
+ *  - `intent`: a translated `reply` / `abort` from inside a callback,
+ *    surfaced so the next turn's prompt can render it without firing
+ *    the corresponding side effect from the callback context. */
+export interface WakeupResolvedPayload {
+  state?: unknown;
+  intent?: { kind: "reply" | "abort"; text: string };
+}
 
 export interface AgentSession {
   /** Outbound stream of session events. Iteration ends after
@@ -174,8 +436,15 @@ export interface AgentSession {
   /** Inject a user message. Synchronous; queues for the worker. */
   send(msg: UserMessage): void;
   /** Cooperative shutdown. Drains the in-flight turn (if any), then
-   *  emits `session_closed` and ends iteration. Idempotent. */
-  close(): Promise<void>;
+   *  emits `session_closed` and ends iteration. Idempotent. The
+   *  optional `reason` is recorded on the `session_closed` event. */
+  close(reason?: string): Promise<void>;
+  /** Release any consumers parked on `events.next()` by resolving them
+   *  with `done: true`. The events stream stays open; the next push and
+   *  next `.next()` proceed normally. Intended for consumers that
+   *  abandoned a `.next()` race (e.g. fire-timeout) and need to clear
+   *  the leaked waiter so subsequent events aren't lost. */
+  cancelEventWaiters(): void;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -200,7 +469,41 @@ export type SandboxEvent =
     target: string;
     logs: SandboxLog[];
   }
-  | { kind: "throw"; error: string; logs: SandboxLog[] };
+  | { kind: "throw"; error: string; logs: SandboxLog[] }
+  /**
+   * Synthetic event produced when a guardrail BLOCKS the sandbox's
+   * original event. Non-terminal: the agent loop pushes it to prior
+   * history and runs another step so the model can revise. The host
+   * sees it via onStep / the transcript like any other event; only the
+   * agent loop's terminal-event check (reply / abort) ignores it.
+   *
+   * `originalKind` is the kind the sandbox actually produced — useful
+   * when the policy reason references the rejected output (e.g.
+   * "your reply was…" vs "your reflect was…").
+   *
+   * `original` carries the full original event payload (minus logs —
+   * those live on the parent `guardrail_blocked` event's `logs` field).
+   * Observers and the next prompt can render exactly what was blocked
+   * so the model knows specifically what to revise.
+   */
+  | {
+    kind: "guardrail_blocked";
+    guardrail: string;
+    reason: string;
+    originalKind: GuardrailBlockedOriginal["kind"];
+    original: GuardrailBlockedOriginal;
+    logs: SandboxLog[];
+  };
+
+/** Original event payload preserved on a `guardrail_blocked` event.
+ *  Same shape as the corresponding `SandboxEvent` variant, minus `logs`
+ *  (those are kept once on the parent `guardrail_blocked` event). */
+export type GuardrailBlockedOriginal =
+  | { kind: "reply"; message: string }
+  | { kind: "abort"; error: string }
+  | { kind: "reflect"; state: unknown }
+  | { kind: "permission_denied"; permission: PermissionKind; target: string }
+  | { kind: "throw"; error: string };
 
 // ────────────────────────────────────────────────────────────────────────────
 // RPC frames (parent ↔ child)
@@ -211,13 +514,23 @@ export interface FrameWakeupScheduled {
   type: "wakeup_scheduled";
   id: string;
   reason: string;
-  /** Source kind: a literal `delay` (timer-based), or `thunk` (general
-   *  promise-returning function). `signal` is reserved for step 5. */
-  wakeupKind: "delay" | "thunk" | "signal";
+  /** Source primitive: `setTimeout` / `setInterval` (timer-based) or an
+   *  unwrapped `reflect(promise)` (`promise`). */
+  wakeupKind: WakeupKind;
+  /** Configured delay (ms) at registration time. Set for timer kinds
+   *  to the `ms` argument passed to `setTimeout` / `setInterval`. Omitted
+   *  for `promise` (no configured period — the promise dictates timing). */
+  delayMs?: number;
 }
 export interface FrameWakeupResolved {
   type: "wakeup_resolved";
   id: string;
+  /** Optional payload describing what (if anything) the callback wants
+   *  to surface to the agent on the next turn. Absent for a silent
+   *  tick (the timer fired but the callback did not call any control
+   *  fn and `autoWakeOnTimer` is off — in which case we skip emitting
+   *  this frame entirely on the child side). */
+  payload?: WakeupResolvedPayload;
 }
 export interface FrameWakeupRejected {
   type: "wakeup_rejected";
@@ -313,6 +626,15 @@ export interface FrameWriteLibResult {
   ok: boolean;
   error?: string;
 }
+/** Parent → Child request to interrupt the in-flight step. Currently
+ *  used to cut short an awaited `reflect(promise)` when the host
+ *  injects a user message — the prelude resolves the wait with an
+ *  `__interrupted_by` sentinel and dispatches the original reflect
+ *  with that payload as state. */
+export interface FrameCancelStep {
+  type: "cancel_step";
+  reason: string;
+}
 
 export type ChildFrame =
   | FrameReply
@@ -335,7 +657,8 @@ export type ChildFrame =
 export type ParentFrame =
   | FrameToolResult
   | FrameStorageResult
-  | FrameWriteLibResult;
+  | FrameWriteLibResult
+  | FrameCancelStep;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Errors
@@ -357,8 +680,13 @@ export class ToolError extends Error {
   }
 }
 
-/** Returned to the sandbox when a tool result exceeds the size cap. */
-export class ToolResultTooLargeError extends Error {
+/** Returned to the sandbox when a tool result exceeds the size cap.
+ *
+ *  Extends `ToolError` so a single `catch (e) { if (e instanceof ToolError) }`
+ *  in agent code handles both validation failures and oversize results.
+ *  `instanceof ToolResultTooLargeError` still works for callers that want
+ *  to discriminate. */
+export class ToolResultTooLargeError extends ToolError {
   constructor(message: string) {
     super(message);
     this.name = "ToolResultTooLargeError";
@@ -397,6 +725,87 @@ export const RESERVED_NAMES = [
   "storage",
   "console",
   // prelude_v2 only (gated on `experimental.asyncWakeups`):
-  "scheduleWakeup",
   "tasks",
+  // prelude_v2 wraps the standard timer globals to drive wakeups; a
+  // user-defined tool with one of these names would clobber the
+  // wrapper and silently disable the interception:
+  "setTimeout",
+  "setInterval",
+  "clearTimeout",
+  "clearInterval",
 ] as const;
+
+// ────────────────────────────────────────────────────────────────────────────
+// Trace events (observability — emitted by Tracer, defined in src/trace.ts)
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Envelope fields stamped onto every trace event by `Tracer.emit`. */
+export interface TraceEventEnvelope {
+  /** Monotonically increasing milliseconds since `Tracer` construction. */
+  ts: number;
+  /** Monotonically increasing per-Tracer sequence (starts at 0). */
+  seq: number;
+}
+
+/**
+ * Discriminated union of every structured event the Tracer fans out. The
+ * Tracer fills in `ts` and `seq`; producers pass the variant fields minus
+ * the envelope (see `TraceEventInput` in `src/trace.ts`).
+ *
+ * Re-exported from this module so callers can `import type { TraceEvent }
+ * from "rex/types"` without reaching into the trace module's internals.
+ */
+export type TraceEvent = TraceEventEnvelope & (
+  | {
+    type: "run_started";
+    task: string;
+    maxSteps: number;
+    sessionId: string | null;
+  }
+  | { type: "step_started"; index: number }
+  | { type: "sandbox_spawned"; index: number; pid?: number }
+  | {
+    type: "tool_call_started";
+    index: number;
+    callId: string;
+    name: string;
+    argsBytes: number;
+  }
+  | {
+    type: "tool_call_finished";
+    index: number;
+    callId: string;
+    name: string;
+    ok: boolean;
+    /** Bytes of the JSON-encoded result. Omitted when `ok=false`. */
+    resultBytes?: number;
+    /** Error message when `ok=false`. */
+    error?: string;
+    durationMs: number;
+  }
+  | {
+    type: "storage_op";
+    index: number;
+    op: "get" | "set" | "del" | "keys";
+    /** Key the op was applied to. `null` for `keys` (no key). */
+    key: string | null;
+    ok: boolean;
+  }
+  | {
+    type: "write_lib";
+    index: number;
+    ok: boolean;
+    sourceBytes: number;
+  }
+  | {
+    type: "sandbox_log";
+    index: number;
+    level: SandboxLog["level"];
+  }
+  | {
+    type: "permission_denied";
+    index: number;
+    permission: PermissionKind;
+    target: string;
+  }
+);

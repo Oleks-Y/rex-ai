@@ -30,6 +30,14 @@ export interface CompileInput {
   sessionDir: string;
   /** Path to lib.ts inside the session dir. Used for the `session:lib` mapping. */
   sessionLibPath: string;
+  /** Additional read-only paths spliced into `--allow-read`. Used by the
+   *  dreaming-agents subsystem to mount a parent session dir read-only on
+   *  a dreamer's sandbox without polluting the dreamer's user-declared
+   *  `permissions.read`. The caller is responsible for ensuring these
+   *  paths are NOT also present in `permissions.write` (writeable parent
+   *  state would break the readonly invariant — `defineDreamer` enforces
+   *  that side). */
+  extraReadOnlyPaths?: string[];
 }
 
 /** Whitespace and shell metachars that would let a value escape its flag. */
@@ -67,8 +75,14 @@ export const PermissionCompiler = {
 
     // Read allowlist — always includes the session dir so `session:lib`
     // resolves. Dedupe so a user who also lists the session dir doesn't
-    // produce a duplicate entry.
-    const readPaths = dedupe([input.sessionDir, ...(p.read ?? [])]);
+    // produce a duplicate entry. `extraReadOnlyPaths` (dreamer-side) is
+    // spliced in here so the resulting flag still goes through the same
+    // safety check and dedupe.
+    const readPaths = dedupe([
+      input.sessionDir,
+      ...(p.read ?? []),
+      ...(input.extraReadOnlyPaths ?? []),
+    ]);
     for (const r of readPaths) assertSafeAllowlistEntry("read", r);
     flags.push(`--allow-read=${readPaths.join(",")}`);
 

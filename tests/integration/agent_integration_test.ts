@@ -151,6 +151,62 @@ Deno.test("exhausted: maxSteps reached without terminal", async () => {
   });
 });
 
+Deno.test("forceFinalReply (default): last-step prompt carries the directive", async () => {
+  await withTempRoot(async (root) => {
+    // 3 reflects in a row → forces all 3 maxSteps slots to fire.
+    const { model, prompts } = mockModel(['await reflect({ i: 0 });']);
+    await new Agent({
+      model,
+      task: "loop",
+      sessionsRoot: root,
+      maxSteps: 3,
+    }).run();
+    // Three generations happened. Only the final one should carry the
+    // "LAST STEP" directive — earlier ones must not, or the model would
+    // be pressured to terminate before it had a chance to make progress.
+    assertEquals(prompts.length, 3);
+    assertEquals(prompts[0].includes("LAST STEP"), false);
+    assertEquals(prompts[1].includes("LAST STEP"), false);
+    assertEquals(prompts[2].includes("LAST STEP"), true);
+  });
+});
+
+Deno.test("forceFinalReply: false disables the directive on every step", async () => {
+  await withTempRoot(async (root) => {
+    const { model, prompts } = mockModel(['await reflect({ i: 0 });']);
+    await new Agent({
+      model,
+      task: "loop",
+      sessionsRoot: root,
+      maxSteps: 3,
+      forceFinalReply: false,
+    }).run();
+    assertEquals(prompts.length, 3);
+    for (const p of prompts) assertEquals(p.includes("LAST STEP"), false);
+  });
+});
+
+Deno.test("forceFinalReply: skipped if agent terminates before final step", async () => {
+  // If reply() comes in early, we never reach the last step at all and
+  // the directive is irrelevant. Sanity-check the prompts contain no
+  // directive on either step.
+  await withTempRoot(async (root) => {
+    const { model, prompts } = mockModel([
+      'await reflect({ i: 0 });',
+      'await reply("done");',
+    ]);
+    const r = await new Agent({
+      model,
+      task: "two-step run",
+      sessionsRoot: root,
+      maxSteps: 5,
+    }).run();
+    assertEquals(r, { kind: "reply", message: "done" });
+    assertEquals(prompts.length, 2);
+    for (const p of prompts) assertEquals(p.includes("LAST STEP"), false);
+  });
+});
+
 Deno.test("tool round-trip end-to-end through the loop", async () => {
   await withTempRoot(async (root) => {
     const { model } = mockModel([
@@ -267,6 +323,100 @@ Deno.test("transcript.jsonl gets one line per step", async () => {
     assertEquals(lines.length, 2);
     assertEquals(lines[0].event.kind, "reflect");
     assertEquals(lines[1].event.kind, "reply");
+  });
+});
+
+Deno.test("missing code fence is recoverable — model retries on next step", async () => {
+  // Turn 1: no fence → synthetic `throw` step. Turn 2: fenced reply → success.
+  // The result is a `reply` RunResult, not an error from agent.run().
+  await withTempRoot(async (root) => {
+    let call = 0;
+    const model: LanguageModelV2 = {
+      specificationVersion: "v2",
+      provider: "rex-mock",
+      modelId: "rex-mock-1",
+      supportedUrls: {},
+      doGenerate: () => {
+        call++;
+        const text = call === 1
+          ? "no fence here, just plain words"
+          : '```ts\nawait reply("recovered");\n```';
+        return Promise.resolve({
+          finishReason: "stop",
+          usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 },
+          content: [{ type: "text", text }],
+          warnings: [],
+        });
+      },
+      doStream: () => {
+        throw new Error("not implemented");
+      },
+    };
+    const stepKinds: string[] = [];
+    const result = await new Agent({
+      model,
+      task: "recover from missing fence",
+      sessionsRoot: root,
+      onStep: (s) => {
+        stepKinds.push(s.event.kind);
+      },
+    }).run();
+    assertEquals(result.kind, "reply");
+    if (result.kind === "reply") assertEquals(result.message, "recovered");
+    assertEquals(stepKinds, ["throw", "reply"]);
+  });
+});
+
+Deno.test("resumeHistory: transcript persists logs and rehydrates them on resume", async () => {
+  await withTempRoot(async (root) => {
+    const sessionId = "log-persist-resume";
+    // Step 1 emits a few console.logs then reflects; step 2 replies.
+    const { model: model1 } = mockModel([
+      'console.log("scan", 42); console.warn("careful"); return reflect({ done: false });',
+      'await reply("done");',
+    ]);
+    const r1 = await new Agent({
+      model: model1,
+      task: "first run",
+      sessionId,
+      sessionsRoot: root,
+    }).run();
+    assertEquals(r1.kind, "reply");
+
+    // Resume: capture the step records the agent sees on replay. The first
+    // resumed step must come back with its original logs (the whole point
+    // of persisting them — a guardrail on resume needs the same evidence
+    // the original prompt had).
+    type StepCapture = { source: string; kind: string; logs: unknown[] };
+    const captured: StepCapture[] = [];
+    const { model: model2 } = mockModel(['await reply("resumed");']);
+    const r2 = await new Agent({
+      model: model2,
+      task: "second run",
+      sessionId,
+      sessionsRoot: root,
+      resumeHistory: true,
+      onStep: (s) => {
+        captured.push({
+          source: s.source,
+          kind: s.event.kind,
+          logs: s.event.logs.map((l) => ({ level: l.level, args: l.args })),
+        });
+      },
+    }).run();
+    assertEquals(r2.kind, "reply");
+
+    const resumed = captured.filter((c) => c.source === "resumed");
+    assertEquals(resumed.length, 2, "both prior steps should be replayed");
+    // Step 1 had two log entries — `scan 42` (log) and `careful` (warn).
+    assertEquals(resumed[0].kind, "reflect");
+    assertEquals(resumed[0].logs, [
+      { level: "log", args: ["scan", 42] },
+      { level: "warn", args: ["careful"] },
+    ]);
+    // Step 2 had no logs.
+    assertEquals(resumed[1].kind, "reply");
+    assertEquals(resumed[1].logs, []);
   });
 });
 

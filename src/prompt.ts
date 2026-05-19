@@ -14,7 +14,11 @@
 // Agent decides how to slot it into the message history.
 
 import type { ToolDescription } from "./tools.ts";
-import type { PermissionsConfig, SandboxEvent } from "./types.ts";
+import type {
+  GuardrailBlockedOriginal,
+  PermissionsConfig,
+  SandboxEvent,
+} from "./types.ts";
 import { zodToTs } from "./zod_to_ts.ts";
 
 export interface PriorStep {
@@ -38,9 +42,18 @@ export interface PromptInput {
   session: SessionSnapshot;
   priorSteps: PriorStep[];
   /** When true, render documentation for the persistent-session-only
-   *  `scheduleWakeup` and `tasks` globals. Off by default (per-step
-   *  path doesn't expose them). */
+   *  timer surface (`setTimeout` / `setInterval` / `clearTimeout` /
+   *  `clearInterval`), `tasks.list` / `tasks.cancel`, and
+   *  `reflect(promise)`. Off by default (per-step path doesn't
+   *  expose any of these). */
   wakeupsEnabled?: boolean;
+  /** Mirrors `ExperimentalOptions.autoWakeOnTimer`. Renders an extra
+   *  paragraph clarifying the policy when true. */
+  autoWakeOnTimer?: boolean;
+  /** When true, the prompt carries a directive telling the model this is
+   *  its LAST allowed step and it must `return reply(...)` or
+   *  `return abort(...)` — anything else ends the turn as `exhausted`. */
+  lastStep?: boolean;
 }
 
 export const PromptBuilder = {
@@ -48,12 +61,13 @@ export const PromptBuilder = {
   build(input: PromptInput): string {
     return [
       headerBlock(),
-      input.wakeupsEnabled === true ? wakeupsBlock() : "",
+      input.wakeupsEnabled === true ? wakeupsBlock(input.autoWakeOnTimer === true) : "",
       permissionsBlock(input.permissions),
       toolsBlock(input.tools),
       sessionBlock(input.session),
       priorStepsBlock(input.priorSteps),
       taskBlock(input.task),
+      input.lastStep === true ? lastStepBlock() : "",
     ].filter((s) => s.length > 0).join("\n\n");
   },
 };
@@ -86,6 +100,12 @@ function headerBlock(): string {
     "  - Always `await` tool calls (e.g. `await sendEmail({...})`). A",
     "    fire-and-forget tool call still executes parent-side, so don't call",
     "    a side-effecting tool unless you really mean to.",
+    "  - Inside a timer callback (setTimeout / setInterval body) use",
+    "    `reflect(value)` to surface results. Do NOT write `reply(...)` or",
+    "    `abort(...)` from inside a callback — the runtime translates them",
+    "    to reflect-with-intent anyway, and writing `reflect` makes the",
+    "    actual control flow obvious. (Silent callbacks that call NO",
+    "    control fn are fine — they're the predicate-poll pattern.)",
     "",
     "Calling a tool with arguments that fail validation throws a ToolError",
     "carrying the specific zod issues. Catch and recover, or `return abort()`.",
@@ -115,7 +135,8 @@ function headerBlock(): string {
     "    step ONLY when there is no data to inspect: refusing the task,",
     "    asking the user a clarifying question, or answering a pure-knowledge",
     "    question that uses no tools. Otherwise: gather → reflect with logs →",
-    "    review on the next step → reply.",
+    "    review on the next step → reply. A guardrail may enforce this and",
+    "    convert a data-bearing reply with no prior reflect into an abort.",
     "",
     "  - Steps are cheap. Prefer two careful steps over one guess. When you",
     "    don't know the exact shape of a tool's output, a file's contents, or",
@@ -188,78 +209,98 @@ function permissionsBlock(p: PermissionsConfig | undefined): string {
   ].join("\n");
 }
 
-function wakeupsBlock(): string {
-  return [
+function wakeupsBlock(autoWakeOnTimer: boolean): string {
+  const lines: string[] = [
     "Async wakeups (persistent-session mode):",
     "",
-    "Two extra globals are available alongside reply/abort/reflect:",
+    "Standard JS timers are available and drive wakeups. They behave just like",
+    "the DOM/Deno APIs you already know, with one twist (below).",
     "",
-    "  scheduleWakeup<T>(thunk: () => Promise<T> | T, opts?: { reason?: string }): TaskHandle<T>",
-    "  scheduleWakeup.delay(ms: number, opts?: { reason?: string }): TaskHandle<void>",
+    "  setTimeout(cb: (...args) => unknown, ms: number, ...args): number",
+    "  setInterval(cb: (...args) => unknown, ms: number, ...args): number",
+    "  clearTimeout(id: number): void",
+    "  clearInterval(id: number): void",
     "",
-    "  tasks.list(): TaskHandle[]            — every scheduled wakeup, any status",
-    "  tasks.pending(): TaskHandle[]         — only pending ones",
-    "  tasks.get(id: string): TaskHandle | null",
-    "  tasks.cancel(id: string, reason?: string): boolean",
+    "Plus two helpers for inspecting and cancelling live timers:",
     "",
-    "TaskHandle = { id, status: 'pending' | 'resolved' | 'rejected' | 'cancelled',",
-    "               reason, wakeupKind, done: Promise<T>, cancel(reason?: string) }",
+    "  tasks.list(): { id, wakeupId, kind, delayMs, status }[]",
+    "  tasks.cancel(id: number): boolean        — same effect as clearTimeout/Interval",
     "",
-    "What scheduleWakeup is for:",
-    "  - Kick off a long-running operation, return reply() to the user, then be",
-    "    woken up later when the operation resolves and continue the conversation.",
-    "  - The TaskHandle and its `done` promise SURVIVE across steps. In a later",
-    "    step you can `await tasks.get(id).done` to retrieve the value.",
+    "The twist — when does a timer callback wake you for another turn?",
+    "  - A callback that calls `reflect(value)` (or `reply(text)` / `abort(text)`,",
+    "    which are translated to reflect with an `intent` payload) wakes you for a",
+    "    new turn whose prior step shows what the callback surfaced.",
+    "  - A callback that does NOT call any control fn is SILENT. It still runs (its",
+    "    side effects — storage writes, console.log, tool calls — happen), but no",
+    "    new turn is scheduled. Use this for cheap-predicate polling: only wake the",
+    "    agent when the predicate fires.",
     "",
-    "Wakeup-driven turns (READ CAREFULLY — these are NOT user requests):",
-    "  - When a wakeup fires, the next prompt has a synthetic prior step:",
-    "      { kind: 'reflect', state: { __wakeup: { id, status, detail } } }",
-    "    There is NO `state` global at runtime — that object lives only in the",
-    "    PRIOR-STEPS history above. Read it from there. Do not write",
-    "    `state.__wakeup` in your code; it will throw `state is not defined`.",
-    "    Find the wakeup id by inspecting the most recent synthetic step in",
-    "    'Prior steps:' and then call `tasks.get('<that id>')`.",
-    "  - A wakeup-driven turn is a CONTINUATION, not a re-initialization. Do",
-    "    NOT re-run the original setup code. Do NOT call reply() with your",
-    "    original confirmation message again. The user already received that.",
-    "    Either: (a) handle the wakeup and reply with new info, (b) reflect()",
-    "    if there's nothing user-visible to say yet, or (c) schedule the next",
-    "    iteration of a recurring job and reflect().",
-    "  - For recurring jobs, write the body inside the thunk you pass to",
-    "    scheduleWakeup. The thunk runs in-sandbox each interval; it can call",
-    "    storage.set / scheduleWakeup.delay etc. on its own. When it resolves",
-    "    you get a wakeup turn; usually you just reflect() (no new user reply).",
+    "From inside a timer callback, `reply` and `abort` do NOT talk to the user",
+    "directly. The text is captured as a translated intent on the next turn's",
+    "synthetic prior step (state.translated_intent), where step-body code can",
+    "decide whether to actually surface it via a real reply()/abort() call. Only",
+    "step-body control fns reach the user.",
     "",
-    "Pattern (typical one-shot):",
-    "  // step N — schedule + reply",
-    "  const h = scheduleWakeup(() => longTool({...}), { reason: 'fetching X' });",
-    "  return reply('Working on it — I will follow up.');",
+    "Synthetic prior step shape (timer-driven turn):",
+    "  { kind: 'reflect', state: {",
+    "    __from_timer: { id: 't_3', kind: 'timeout' | 'interval', delayMs: number | null },",
+    "    callback_state?: <whatever reflect() was called with>,",
+    "    translated_intent?: { kind: 'reply' | 'abort', message?: string, error?: string },",
+    "    error?: <message, when the callback threw>,",
+    "  } }",
+    "  There is no `state` global at runtime — read this off the PRIOR STEPS",
+    "  above, not from a variable.",
     "",
-    "  // step N+K — wakeup-driven turn (synthetic __wakeup in prior steps)",
-    "  const t = tasks.get('w_3');",
-    "  if (t?.status === 'resolved') {",
-    "    const value = await t.done;",
-    "    return reply('Result: ' + JSON.stringify(value));",
-    "  }",
+    "`reflect(promise)` — release the turn while a long operation runs:",
+    "  Returning `reflect(somePromise)` makes the runtime AWAIT the promise before",
+    "  finishing this step. The next step's reflect state is the resolved value",
+    "  (no `__wakeup` wrapper, no lookup needed). On rejection, the step ends as",
+    "  a thrown error which you can react to in the next prompt's transcript.",
+    "  Use this for \"do the work in the background and continue when ready\"",
+    "  patterns instead of scheduling-then-looking-up.",
     "",
-    "Pattern (recurring job, e.g. 'every 30s'):",
-    "  // initial step — schedule a self-rescheduling thunk and reply once",
-    "  const tick = async () => {",
-    "    const batch = makeBatch();",
-    "    const prior = (await storage.get('batches')) as unknown[] ?? [];",
-    "    await storage.set('batches', [...(prior as unknown[]), batch]);",
-    "    scheduleWakeup.delay(30_000, { reason: 'next tick' });",
-    "  };",
-    "  scheduleWakeup(tick, { reason: 'first tick' });",
-    "  return reply('Recurring job started.');",
+    "Pattern (one-shot async result, no intermediate user message):",
+    "  // step N — return reflect(promise), runtime awaits it before settling",
+    "  return reflect(fetchDataset(42));",
+    "  // step N+1 — prior reflect.state IS the resolved dataset",
     "",
-    "  // wakeup-driven turn — usually just reflect, do NOT re-set-up the job:",
-    "  return reflect({ note: 'tick completed' });",
+    "Pattern (recurring job — predicate poll):",
+    "  setInterval(async () => {",
+    "    const data = await fetchSomething();",
+    "    if (data.alarming) {",
+    "      // translated to reflect — the next wakeup-driven turn sees it as",
+    "      // a translated_intent and decides whether to actually reply().",
+    "      reply('Alert: ' + data.kind);",
+    "    }",
+    "    // No control fn called → tick is silent, no wakeup turn.",
+    "  }, 30_000);",
+    "  return reply('Watching.');",
     "",
-    "Don't await the handle's done promise SYNCHRONOUSLY in the scheduling step",
-    "unless you want that step to block until it resolves — that defeats the",
-    "purpose. Reply first, then look up the value in the wakeup-driven turn.",
-  ].join("\n");
+    "Cancellation:",
+    "  const id = setInterval(tick, 30_000);",
+    "  // ... later ...",
+    "  clearInterval(id);   // also: tasks.cancel(id);",
+    "",
+    "Practical notes:",
+    "  - Don't use intervals tighter than ~100ms. Each fire crosses an RPC and",
+    "    payload-bearing fires book an LLM turn — keep the cadence loose.",
+    "  - A wakeup-driven turn is a CONTINUATION. Do NOT re-run the original setup",
+    "    code or repeat your last reply(). Either react with new info, reflect()",
+    "    when there's nothing to say, or just let the silent tick stand.",
+    "  - If the user sends a new message while you're awaiting a `reflect(promise)`,",
+    "    the wait is interrupted; the next step's reflect state will be",
+    "    `{ __interrupted_by: 'user_message' }` and the user_message turn runs next.",
+  ];
+  if (autoWakeOnTimer) {
+    lines.push(
+      "",
+      "Host policy: `autoWakeOnTimer` is ON. Every timer fire wakes you, even",
+      "callbacks that did not call any control fn — the callback's return value",
+      "becomes the synthetic prior step's `callback_state`. Plan accordingly:",
+      "even silent ticks cost an LLM turn at this setting.",
+    );
+  }
+  return lines.join("\n");
 }
 
 function toolsBlock(tools: ToolDescription[]): string {
@@ -350,6 +391,28 @@ function eventSummary(ev: SandboxEvent): string {
       return `Result: reply — message sent to user: ${safeStr(ev.message)}`;
     case "abort":
       return `Result: abort — ${safeStr(ev.error)}`;
+    case "guardrail_blocked":
+      return [
+        `Result: BLOCKED by guardrail '${ev.guardrail}' — ${ev.reason}`,
+        `Your previous ${ev.originalKind} was rejected by policy and was NOT delivered to the user.`,
+        `Blocked payload: ${renderBlockedOriginal(ev.original)}`,
+        `REVISE your approach to satisfy the policy on the next step. Repeating the same code will block again the same way.`,
+      ].join("\n");
+  }
+}
+
+function renderBlockedOriginal(o: GuardrailBlockedOriginal): string {
+  switch (o.kind) {
+    case "reply":
+      return `reply(${safeStr(o.message)})`;
+    case "abort":
+      return `abort(${safeStr(o.error)})`;
+    case "reflect":
+      return `reflect(${safeStr(o.state)})`;
+    case "permission_denied":
+      return `permission_denied(${o.permission}: ${safeStr(o.target)})`;
+    case "throw":
+      return `threw(${safeStr(o.error)})`;
   }
 }
 
@@ -369,4 +432,21 @@ function safeStr(v: unknown): string {
 
 function taskBlock(task: string): string {
   return `Task: ${task}`;
+}
+
+function lastStepBlock(): string {
+  return [
+    "⚠ LAST STEP — read carefully:",
+    "",
+    "This is your FINAL allowed step in this turn. The runtime will NOT",
+    "generate another step after this one. You MUST end this step with one of:",
+    "  - return reply(<answer>)  — deliver your best answer to the user",
+    "  - return abort(<reason>)  — declare what's missing so the user knows",
+    "",
+    "Anything else (`return reflect(...)`, an uncaught throw, or no terminal",
+    "call at all) ends the turn as EXHAUSTED with NO answer reaching the user.",
+    "Even if your evidence is incomplete, summarize what you DO know in",
+    "reply(), or abort() with a specific account of what's blocking you.",
+    "Do not start new tool work that can't finish in this step.",
+  ].join("\n");
 }

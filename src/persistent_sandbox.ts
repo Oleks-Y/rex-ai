@@ -11,10 +11,10 @@
 // async-wakeup-mode plan). Step source is module-guarded per step at
 // the parent before the exec frame is sent.
 //
-// As of step 4, the prelude exposes `scheduleWakeup` + `tasks`; this
-// file relays the resulting wakeup_* frames through `WakeupHandlers`
-// and keeps a parent-side `WakeupDescriptor` mirror. Soft cancel
-// (step 6) and tier-3 SIGKILL+restart (step 7) still aren't here. A
+// The prelude exposes wrapped `setTimeout` / `setInterval` /
+// `clearTimeout` / `clearInterval` plus a slim `tasks` API; this file
+// relays the resulting wakeup_* frames through `WakeupHandlers` and
+// keeps a parent-side `WakeupDescriptor` mirror with periodic GC. A
 // step that exceeds the wall-clock cap SIGKILLs the subprocess and
 // marks the sandbox closed, so subsequent runStep calls short-circuit.
 
@@ -32,6 +32,8 @@ import {
   type SandboxEvent,
   type SandboxLog,
   type SizeCaps,
+  type WakeupKind,
+  type WakeupResolvedPayload,
 } from "./types.ts";
 
 const enc = new TextEncoder();
@@ -51,26 +53,37 @@ function classifyPermission(raw: string): PermissionKind {
 }
 
 /** Parent-side mirror of one scheduled wakeup. Survives sandbox-level
- *  events (e.g. tier-3 restart, step 7) — the actual JS promise lives
- *  in the subprocess and dies with it, but the descriptor here lets
- *  the host re-create timer-based wakeups on restart and surface
- *  scheduled tasks in event streams. */
+ *  events (e.g. tier-3 restart, step 7) — the actual JS timer / promise
+ *  lives in the subprocess and dies with it, but the descriptor here
+ *  lets the host surface scheduled tasks in event streams.
+ *
+ *  For `wakeupKind === "interval"`, the descriptor stays in `pending`
+ *  status across fires — each tick that surfaces a payload updates
+ *  `lastPayload`, but only `clearInterval` (→ `wakeup_cancelled`)
+ *  transitions to a terminal status. */
 export interface WakeupDescriptor {
   id: string;
   reason: string;
-  wakeupKind: "delay" | "thunk" | "signal";
+  wakeupKind: WakeupKind;
   status: "pending" | "resolved" | "rejected" | "cancelled";
   /** Wall-clock ms when the wakeup was registered (parent-side). */
   scheduledAt: number;
-  /** Set on terminal transition. */
+  /** Set on terminal transition. For intervals: only on cancellation. */
   resolvedAt?: number;
   error?: string;
   cancelReason?: string;
+  /** Most recent payload from a `wakeup_resolved` for this id. For
+   *  intervals this overwrites on each tick; for timeouts/promises it
+   *  is the (single) payload. Absent for silent ticks. */
+  lastPayload?: WakeupResolvedPayload;
+  /** Configured delay (ms) at registration time, mirrored from the
+   *  `wakeup_scheduled` frame. Set for timer kinds; absent for promise. */
+  delayMs?: number;
 }
 
 export interface WakeupHandlers {
   onScheduled?(d: WakeupDescriptor): void;
-  onResolved?(id: string): void;
+  onResolved?(id: string, payload?: WakeupResolvedPayload): void;
   onRejected?(id: string, error: string): void;
   onCancelled?(id: string, reason: string): void;
 }
@@ -86,7 +99,23 @@ export interface PersistentSandboxOpenInput {
    *  matching frame; PersistentSandbox itself does no AgentSession-
    *  specific bookkeeping beyond the parent-side mirror. */
   wakeupHandlers?: WakeupHandlers;
+  /** When true, every fire of a wrapped timer wakes the agent (the
+   *  callback's return value becomes the synthetic prior step's
+   *  reflect state). Default false. Mirrors
+   *  `ExperimentalOptions.autoWakeOnTimer`. */
+  autoWakeOnTimer?: boolean;
+  /** Extra read-only paths spliced into --allow-read. Dreamer-only;
+   *  every non-dreamer call site leaves this unset. */
+  extraReadOnlyPaths?: string[];
 }
+
+/** Mirror size + GC tuning. Plan §"Decisions made" Issue 14: drop
+ *  terminal entries 60s after settle, GC pass every 30s, hard cap of
+ *  1000 entries with FIFO eviction of oldest terminal entries as a
+ *  backstop. */
+const WAKEUP_MIRROR_GC_INTERVAL_MS = 30_000;
+const WAKEUP_MIRROR_TERMINAL_TTL_MS = 60_000;
+const WAKEUP_MIRROR_MAX_ENTRIES = 1000;
 
 export interface RunStepInput {
   llmCode: string;
@@ -98,8 +127,11 @@ export class PersistentSandbox {
   readonly #permissions: PermissionsConfig | undefined;
   readonly #sizeCaps: SizeCaps;
   readonly #allowedModules: string[];
+  readonly #extraReadOnlyPaths: string[];
   readonly #wakeupHandlers: WakeupHandlers;
   readonly #wakeupMirror: Map<string, WakeupDescriptor> = new Map();
+  readonly #autoWakeOnTimer: boolean;
+  #gcTimer: number | null = null;
 
   #proc: Deno.ChildProcess | null = null;
   #reader: FrameReader | null = null;
@@ -129,6 +161,13 @@ export class PersistentSandbox {
   #stepChain: Promise<unknown> = Promise.resolve();
   /** Per-step file paths we've written so close() can clean them up. */
   #stepFiles: string[] = [];
+  /** Hooks installed by the active `runStep` so wakeup frame handlers
+   *  can extend / restore the per-step deadline when an unwrapped
+   *  `reflect(promise)` is awaiting. Null between steps. */
+  #activeStepDeadline: {
+    onPromiseScheduled: (id: string) => void;
+    onPromiseSettled: (id: string) => void;
+  } | null = null;
   /** Stderr buffer for diagnostics on unexpected exit. */
   #stderrChunks: Uint8Array[] = [];
   #stderrCollect: Promise<void> = Promise.resolve();
@@ -139,14 +178,18 @@ export class PersistentSandbox {
     permissions: PermissionsConfig | undefined;
     sizeCaps: SizeCaps;
     allowedModules: string[];
+    extraReadOnlyPaths: string[];
     wakeupHandlers: WakeupHandlers;
+    autoWakeOnTimer: boolean;
   }) {
     this.#tools = args.tools;
     this.#session = args.session;
     this.#permissions = args.permissions;
     this.#sizeCaps = args.sizeCaps;
     this.#allowedModules = args.allowedModules;
+    this.#extraReadOnlyPaths = args.extraReadOnlyPaths;
     this.#wakeupHandlers = args.wakeupHandlers;
+    this.#autoWakeOnTimer = args.autoWakeOnTimer;
   }
 
   static async open(input: PersistentSandboxOpenInput): Promise<PersistentSandbox> {
@@ -157,9 +200,12 @@ export class PersistentSandbox {
       permissions: input.permissions,
       sizeCaps: input.sizeCaps,
       allowedModules,
+      extraReadOnlyPaths: input.extraReadOnlyPaths ?? [],
       wakeupHandlers: input.wakeupHandlers ?? {},
+      autoWakeOnTimer: input.autoWakeOnTimer === true,
     });
     await sandbox.#spawn(input.v8MaxOldSpaceMb ?? 512);
+    sandbox.#startWakeupMirrorGc();
     return sandbox;
   }
 
@@ -169,11 +215,16 @@ export class PersistentSandbox {
   }
 
   async #spawn(v8MaxOldSpaceMb: number): Promise<void> {
-    const script = PreludeV2.build({ tools: this.#tools.describe() });
+    const script = PreludeV2.build({
+      tools: this.#tools.describe(),
+      autoWakeOnTimer: this.#autoWakeOnTimer,
+      reflectPromiseTimeoutMs: this.#sizeCaps.reflectPromiseTimeoutMs,
+    });
     const compiled = PermissionCompiler.compile({
       permissions: this.#permissions,
       sessionDir: this.#session.dir,
       sessionLibPath: this.#session.libPath,
+      extraReadOnlyPaths: this.#extraReadOnlyPaths,
     });
 
     const scriptPath = join(this.#session.dir, "__prelude_v2.ts");
@@ -297,7 +348,11 @@ export class PersistentSandbox {
       status: "pending",
       scheduledAt: Date.now(),
     };
+    if (frame.delayMs !== undefined) desc.delayMs = frame.delayMs;
     this.#wakeupMirror.set(frame.id, desc);
+    if (frame.wakeupKind === "promise") {
+      this.#activeStepDeadline?.onPromiseScheduled(frame.id);
+    }
     try {
       this.#wakeupHandlers.onScheduled?.(desc);
     } catch { /* host callback errors are not fatal */ }
@@ -305,12 +360,21 @@ export class PersistentSandbox {
 
   #handleWakeupResolved(frame: import("./types.ts").FrameWakeupResolved): void {
     const desc = this.#wakeupMirror.get(frame.id);
-    if (desc && desc.status === "pending") {
-      desc.status = "resolved";
-      desc.resolvedAt = Date.now();
+    if (desc) {
+      if (frame.payload) desc.lastPayload = frame.payload;
+      // Intervals keep firing — the descriptor stays pending until the
+      // host calls clearInterval (→ wakeup_cancelled). Only timeout /
+      // promise wakeups are terminal at this point.
+      if (desc.wakeupKind !== "interval" && desc.status === "pending") {
+        desc.status = "resolved";
+        desc.resolvedAt = Date.now();
+      }
+      if (desc.wakeupKind === "promise") {
+        this.#activeStepDeadline?.onPromiseSettled(frame.id);
+      }
     }
     try {
-      this.#wakeupHandlers.onResolved?.(frame.id);
+      this.#wakeupHandlers.onResolved?.(frame.id, frame.payload);
     } catch { /* */ }
   }
 
@@ -320,6 +384,9 @@ export class PersistentSandbox {
       desc.status = "rejected";
       desc.resolvedAt = Date.now();
       desc.error = frame.error;
+      if (desc.wakeupKind === "promise") {
+        this.#activeStepDeadline?.onPromiseSettled(frame.id);
+      }
     }
     try {
       this.#wakeupHandlers.onRejected?.(frame.id, frame.error);
@@ -332,10 +399,56 @@ export class PersistentSandbox {
       desc.status = "cancelled";
       desc.resolvedAt = Date.now();
       desc.cancelReason = frame.reason;
+      if (desc.wakeupKind === "promise") {
+        this.#activeStepDeadline?.onPromiseSettled(frame.id);
+      }
     }
     try {
       this.#wakeupHandlers.onCancelled?.(frame.id, frame.reason);
     } catch { /* */ }
+  }
+
+  /** Send a `cancel_step` frame. Used by AgentSessionImpl to interrupt
+   *  an in-flight `reflect(promise)` wait when a user message arrives.
+   *  The dispatcher resolves the wait synthetically and dispatches
+   *  reflect with `{ __interrupted_by: reason }` as state. */
+  cancelStep(reason: string): Promise<void> {
+    if (this.#closed) return Promise.resolve();
+    return this.#writeFrame({ type: "cancel_step", reason }).catch(() => {});
+  }
+
+  // ── wakeup mirror GC ──────────────────────────────────────────────────
+
+  #startWakeupMirrorGc(): void {
+    // Use the host's native setTimeout (the wrappers live only inside
+    // the sandbox subprocess; we're safe). `unref` so this doesn't
+    // hold the event loop open at shutdown.
+    const handle = setInterval(() => this.#runWakeupMirrorGc(), WAKEUP_MIRROR_GC_INTERVAL_MS);
+    // deno-lint-ignore no-explicit-any
+    if (typeof (handle as any).unref === "function") (handle as any).unref();
+    this.#gcTimer = handle;
+  }
+
+  #runWakeupMirrorGc(): void {
+    if (this.#wakeupMirror.size === 0) return;
+    const cutoff = Date.now() - WAKEUP_MIRROR_TERMINAL_TTL_MS;
+    for (const [id, d] of this.#wakeupMirror) {
+      if (d.status !== "pending" && (d.resolvedAt ?? 0) < cutoff) {
+        this.#wakeupMirror.delete(id);
+      }
+    }
+    // Hard cap backstop. Iteration order is insertion order, so the
+    // earliest-inserted terminal entries get evicted first.
+    if (this.#wakeupMirror.size > WAKEUP_MIRROR_MAX_ENTRIES) {
+      let overflow = this.#wakeupMirror.size - WAKEUP_MIRROR_MAX_ENTRIES;
+      for (const [id, d] of this.#wakeupMirror) {
+        if (overflow <= 0) break;
+        if (d.status !== "pending") {
+          this.#wakeupMirror.delete(id);
+          overflow--;
+        }
+      }
+    }
   }
 
   runStep(input: RunStepInput): Promise<SandboxEvent> {
@@ -393,21 +506,68 @@ export class PersistentSandbox {
     // for step 2 we kill the subprocess and mark the sandbox dead. The
     // current step returns a synthetic throw; subsequent runStep calls
     // see #closed and short-circuit.
-    const timeoutMs = this.#sizeCaps.stepTimeoutMs;
-    const timeoutHandle = setTimeout(() => {
-      const reason = `step exceeded ${timeoutMs}ms wall-clock cap; sandbox killed`;
+    //
+    // The deadline is re-armable: when the prelude unwraps a
+    // `reflect(promise)` and emits `wakeup_scheduled` with
+    // `wakeupKind: "promise"`, we extend the deadline to
+    // `max(stepDeadline, scheduledAt + reflectPromiseTimeoutMs)` so the
+    // separate `reflectPromiseTimeoutMs` cap is actually reachable.
+    // When that wakeup settles (resolve / reject / cancel), the deadline
+    // recomputes — empty active set returns to the original step
+    // deadline.
+    const stepStart = Date.now();
+    const stepTimeoutMs = this.#sizeCaps.stepTimeoutMs;
+    const reflectPromiseTimeoutMs = this.#sizeCaps.reflectPromiseTimeoutMs;
+    const baseDeadline = stepStart + stepTimeoutMs;
+    const activePromises = new Map<string, number>();
+    let currentDeadline = baseDeadline;
+    let timeoutHandle: number | null = null;
+
+    const fireDeadline = () => {
+      const elapsed = currentDeadline - stepStart;
+      const reason = `step exceeded ${elapsed}ms wall-clock cap; sandbox killed`;
       this.#markClosed(reason);
       try {
         this.#proc?.kill("SIGKILL");
       } catch { /* already gone */ }
       collector.fail(reason);
-    }, timeoutMs);
+    };
+    const armTimer = () => {
+      if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+      const delay = Math.max(0, currentDeadline - Date.now());
+      timeoutHandle = setTimeout(fireDeadline, delay);
+    };
+    const recomputeDeadline = () => {
+      let extension = 0;
+      for (const at of activePromises.values()) {
+        const candidate = at + reflectPromiseTimeoutMs;
+        if (candidate > extension) extension = candidate;
+      }
+      const newDeadline = Math.max(baseDeadline, extension);
+      if (newDeadline !== currentDeadline) {
+        currentDeadline = newDeadline;
+        armTimer();
+      }
+    };
+
+    this.#activeStepDeadline = {
+      onPromiseScheduled: (id) => {
+        activePromises.set(id, Date.now());
+        recomputeDeadline();
+      },
+      onPromiseSettled: (id) => {
+        if (!activePromises.delete(id)) return;
+        recomputeDeadline();
+      },
+    };
+    armTimer();
 
     let event: SandboxEvent;
     try {
       event = await collector.done;
     } finally {
-      clearTimeout(timeoutHandle);
+      if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+      this.#activeStepDeadline = null;
       this.#activeCollector = null;
     }
 
@@ -438,6 +598,11 @@ export class PersistentSandbox {
   async close(): Promise<void> {
     const wasClosed = this.#closed;
     this.#markClosed("persistent sandbox closed");
+
+    if (this.#gcTimer !== null) {
+      clearInterval(this.#gcTimer);
+      this.#gcTimer = null;
+    }
 
     // Graceful shutdown with a hard timeout backstop. Order:
     //   1. Send `shutdown` frame so the dispatcher exits cleanly.
