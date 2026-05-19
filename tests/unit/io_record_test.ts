@@ -321,6 +321,148 @@ Deno.test("step isolation: events from step N don't leak into step N+1", async (
   });
 });
 
+Deno.test("regression — concurrent record*() honors ioStepTotalBytes (review finding #1)", async () => {
+  await withTempDir(async (dir) => {
+    // Two 100-byte calls fired in parallel, step budget = 100. Without
+    // serialization both can read #stepBodyBytes at 0 and both persist
+    // their 100 bytes. With the op chain in place, the second must
+    // observe the first's increment and record metadata-only.
+    const rec = new IORecorder({
+      sessionDir: dir,
+      caps: caps({ ioBodyBytes: 200, ioStepTotalBytes: 100 }),
+    });
+    rec.beginStep(1);
+    const a = rec.recordToolCall({
+      callId: "a", name: "t", argsJson: "a".repeat(100),
+      result: { ok: true, valueJson: "" }, durationMs: 1,
+    });
+    const b = rec.recordToolCall({
+      callId: "b", name: "t", argsJson: "b".repeat(100),
+      result: { ok: true, valueJson: "" }, durationMs: 1,
+    });
+    await Promise.all([a, b]);
+    const events = await rec.flushStep(1);
+    assertEquals(events.length, 2);
+    if (events[0].kind !== "tool_call" || events[1].kind !== "tool_call") {
+      throw new Error("kind");
+    }
+    // Total bytes persisted to blobs must be <= step cap.
+    let totalBytes = 0;
+    for await (const ent of walkFiles(join(dir, "blobs"))) {
+      if (ent.isFile) {
+        const stat = await Deno.stat(ent.path);
+        totalBytes += stat.size;
+      }
+    }
+    assertEquals(
+      totalBytes <= 100,
+      true,
+      `total blob bytes must respect step cap; got ${totalBytes}`,
+    );
+    // First call (entered first) gets the blob; second is metadata-only.
+    assertNotEquals(events[0].argsRef, undefined);
+    assertEquals(events[1].argsRef, undefined);
+  });
+});
+
+Deno.test("regression — seq reflects call order, not async-completion order (review finding #2)", async () => {
+  await withTempDir(async (dir) => {
+    // recordA enters first but does no async work besides the chain.
+    // recordB enters second. Without serialization B could push before
+    // A finishes its blob write. With the op chain + sync seq capture,
+    // io.jsonl shows A at seq=0, B at seq=1.
+    const rec = new IORecorder({ sessionDir: dir, caps: caps() });
+    rec.beginStep(1);
+    // Fire in deterministic order; do not await individually.
+    const p1 = rec.recordToolCall({
+      callId: "first", name: "t",
+      argsJson: "a".repeat(100), // bigger body → slower hash + write
+      result: { ok: true, valueJson: "" }, durationMs: 1,
+    });
+    const p2 = rec.recordToolCall({
+      callId: "second", name: "t",
+      argsJson: "b", // tiny body, would finish first if parallel
+      result: { ok: true, valueJson: "" }, durationMs: 1,
+    });
+    await Promise.all([p1, p2]);
+    const events = await rec.flushStep(1);
+    assertEquals(events.length, 2);
+    if (events[0].kind !== "tool_call" || events[1].kind !== "tool_call") {
+      throw new Error("kind");
+    }
+    assertEquals(events[0].callId, "first");
+    assertEquals(events[1].callId, "second");
+    // And the on-disk io.jsonl agrees.
+    const rows = await readJsonl(join(dir, "io.jsonl"));
+    assertEquals(rows[0].seq, 0);
+    assertEquals((rows[0] as { callId: string }).callId, "first");
+    assertEquals(rows[1].seq, 1);
+    assertEquals((rows[1] as { callId: string }).callId, "second");
+  });
+});
+
+Deno.test("regression — ioBodyBytes=0 records metadata-only without empty-sha blobs (review finding #3)", async () => {
+  await withTempDir(async (dir) => {
+    const rec = new IORecorder({
+      sessionDir: dir,
+      caps: caps({ ioBodyBytes: 0 }),
+    });
+    rec.beginStep(1);
+    await rec.recordToolCall({
+      callId: "c", name: "t", argsJson: "anything",
+      result: { ok: true, valueJson: "value" }, durationMs: 1,
+    });
+    const [ev] = await rec.flushStep(1);
+    if (ev.kind !== "tool_call") throw new Error("kind");
+    assertEquals(ev.argsRef, undefined, "no blob ref when ioBodyBytes = 0");
+    if (!ev.result.ok) throw new Error("expected ok");
+    assertEquals(ev.result.valueRef, undefined, "no value ref when ioBodyBytes = 0");
+    assertEquals(ev.argsBytes, 8); // original size still recorded
+    // No blob files written.
+    let any = false;
+    for await (const _ of walkFiles(join(dir, "blobs"))) any = true;
+    assertEquals(any, false);
+  });
+});
+
+Deno.test("constructor rejects negative IO caps", () => {
+  let threw = false;
+  try {
+    new IORecorder({
+      sessionDir: "/tmp/x",
+      caps: caps({ ioBodyBytes: -1 }),
+    });
+  } catch { threw = true; }
+  assertEquals(threw, true);
+  threw = false;
+  try {
+    new IORecorder({
+      sessionDir: "/tmp/x",
+      caps: caps({ ioStepTotalBytes: -1 }),
+    });
+  } catch { threw = true; }
+  assertEquals(threw, true);
+});
+
+Deno.test("flushStep awaits in-flight record ops before draining", async () => {
+  await withTempDir(async (dir) => {
+    // If flushStep returned before pending blob writes settled, the
+    // event would be absent from the returned array and io.jsonl. The
+    // op chain guarantees flushStep waits for all enqueued record ops.
+    const rec = new IORecorder({ sessionDir: dir, caps: caps() });
+    rec.beginStep(1);
+    rec.recordToolCall({
+      callId: "c", name: "t", argsJson: "x".repeat(1024),
+      result: { ok: true, valueJson: "y" }, durationMs: 1,
+    });
+    // Note: NOT awaiting the recordToolCall above.
+    const events = await rec.flushStep(1);
+    assertEquals(events.length, 1, "flushStep must wait for the pending record");
+    const rows = await readJsonl(join(dir, "io.jsonl"));
+    assertEquals(rows.length, 1);
+  });
+});
+
 Deno.test("blobRelPath: two-level shard from first 4 hex chars", () => {
   assertEquals(
     blobRelPath("ab12cdef" + "00".repeat(28)),
