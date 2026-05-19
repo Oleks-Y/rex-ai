@@ -57,8 +57,10 @@ export type {
   AgentEvent,
   AgentOptions,
   AgentSession,
+  BlobRef,
   ExperimentalOptions,
   GuardrailBlockedOriginal,
+  IOEvent,
   PermissionsConfig,
   RunResult,
   SandboxEvent,
@@ -69,9 +71,12 @@ export type {
   UserMessage,
 } from "./types.ts";
 export {
+  IO_REDACTED_VALUE,
   NoCodeBlockError,
   SessionLockedError,
   ToolError,
   ToolResultTooLargeError,
   WriteLibError,
 } from "./types.ts";
+export { blobRelPath, IORecorder } from "./io_record.ts";
+export type { IORecorderOpts } from "./io_record.ts";

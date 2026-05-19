@@ -60,7 +60,24 @@ export interface SizeCaps {
    *  `reflect(promise)` is "I don't know how long this takes." Default
    *  300_000 (5 min). */
   reflectPromiseTimeoutMs: number;
+  /** Max bytes captured per fetch/fs response body before truncation.
+   *  Bodies larger than this are stored truncated to this many bytes
+   *  with `BlobRef.truncated = true`. Default 256 KiB. */
+  ioBodyBytes: number;
+  /** Max total IO-body bytes captured per step across all IO events.
+   *  Once this budget is exhausted, subsequent events in the same step
+   *  are recorded with metadata only (no `bodyRef`). Default 4 MiB. */
+  ioStepTotalBytes: number;
+  /** Header names to redact to `"<redacted>"` on capture (case-insensitive
+   *  match). Default: authorization, cookie, set-cookie, x-api-key. */
+  ioRedactHeaders: string[];
 }
+
+/** Sentinel placed in the `headers` map of an `IOEvent.fetch` request /
+ *  response when a header name matched `SizeCaps.ioRedactHeaders`. Kept
+ *  as a const so downstream readers can grep / compare without importing
+ *  the recorder. */
+export const IO_REDACTED_VALUE = "<redacted>";
 
 export const DEFAULT_SIZE_CAPS: SizeCaps = {
   logBytes: 64 * 1024,
@@ -70,6 +87,9 @@ export const DEFAULT_SIZE_CAPS: SizeCaps = {
   storageBytes: 1024 * 1024,
   stepTimeoutMs: 60_000,
   reflectPromiseTimeoutMs: 5 * 60_000,
+  ioBodyBytes: 256 * 1024,
+  ioStepTotalBytes: 4 * 1024 * 1024,
+  ioRedactHeaders: ["authorization", "cookie", "set-cookie", "x-api-key"],
 };
 
 export interface StepRecord {
@@ -79,7 +99,102 @@ export interface StepRecord {
   source: "fresh" | "resumed";
   code: string;
   event: SandboxEvent;
+  /** Side-effecting interactions the step performed (fetch, fs reads,
+   *  tool calls, lib writes) in temporal order. Populated for `"fresh"`
+   *  steps by the agent loop after step flush; absent on `"resumed"`
+   *  steps unless the resume path explicitly rehydrates from
+   *  `io.jsonl` (see docs/plans/extended-transcript §6). */
+  io?: IOEvent[];
 }
+
+/** Content-addressed reference to an IO body (request/response payload,
+ *  fs read bytes, tool args/result JSON). Bodies live under the session
+ *  directory at `path` — typically `blobs/<sha[0:2]>/<sha[2:4]>/<sha>`.
+ *  When `truncated` is true, the file holds only the first
+ *  `SizeCaps.ioBodyBytes` bytes of the original body, hashed *after*
+ *  truncation so the ref is reproducible. */
+export interface BlobRef {
+  /** SHA-256 of the bytes on disk (which may be a truncated prefix). */
+  sha256: string;
+  /** Path relative to the session directory, POSIX-style. */
+  path: string;
+  /** True when the on-disk body is a truncated prefix of the original. */
+  truncated: boolean;
+}
+
+/** One side-effecting interaction performed by a sandbox step. Ride-along
+ *  to `SandboxEvent` — the existing union stays byte-for-byte stable
+ *  (resume invariant), and dreamers / observers opt in by reading
+ *  `io.jsonl`. See docs/plans/extended-transcript.md for rationale. */
+export type IOEvent =
+  | {
+    kind: "fetch";
+    /** Per-step monotonic id assigned by the recorder. Lets a reader
+     *  pair a request with its response if the recorder ever splits
+     *  them into two frames. */
+    callId: string;
+    request: {
+      url: string;
+      method: string;
+      /** Headers AFTER redaction. Names listed in `SizeCaps.ioRedactHeaders`
+       *  appear with value `IO_REDACTED_VALUE`. */
+      headers: Record<string, string>;
+      /** Reference to the request body bytes. Absent when the request
+       *  had no body or the per-step body budget was exhausted before
+       *  this event was recorded. */
+      bodyRef?: BlobRef;
+      /** Original body size in bytes, BEFORE any truncation. 0 when
+       *  there was no body. */
+      bodyBytes: number;
+    };
+    response:
+      | {
+        status: number;
+        headers: Record<string, string>;
+        bodyRef?: BlobRef;
+        bodyBytes: number;
+        contentType?: string;
+      }
+      | { error: string };
+    durationMs: number;
+  }
+  | {
+    kind: "fs_read";
+    /** Absolute, post-resolve path the agent passed (or the resolved
+     *  path returned by the FS call, whichever the wrapper has
+     *  closest at the time of recording). */
+    path: string;
+    /** Which Deno read API the agent invoked — useful signal for
+     *  "you used `readTextFile` on a 4MB file when you only needed
+     *  the first line". */
+    api: "readTextFile" | "readFile" | "readDir" | "stat";
+    result:
+      | { ok: true; bytes: number; bodyRef?: BlobRef }
+      | { ok: true; entries: number }
+      | { ok: true; stat: Record<string, unknown> }
+      | { ok: false; error: string };
+    durationMs: number;
+  }
+  | {
+    kind: "tool_call";
+    callId: string;
+    name: string;
+    argsRef?: BlobRef;
+    argsBytes: number;
+    result:
+      | { ok: true; valueRef?: BlobRef; valueBytes: number }
+      | { ok: false; error: string };
+    durationMs: number;
+  }
+  | {
+    kind: "write_lib";
+    ok: boolean;
+    sourceBytes: number;
+    /** Present only on accepted writes. */
+    sourceRef?: BlobRef;
+    /** Present on rejection. */
+    error?: string;
+  };
 
 /** Lifecycle phase of a single in-flight sandbox step.
  *
