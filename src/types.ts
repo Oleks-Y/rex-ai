@@ -321,8 +321,15 @@ export interface AgentSession {
   /** Inject a user message. Synchronous; queues for the worker. */
   send(msg: UserMessage): void;
   /** Cooperative shutdown. Drains the in-flight turn (if any), then
-   *  emits `session_closed` and ends iteration. Idempotent. */
-  close(): Promise<void>;
+   *  emits `session_closed` and ends iteration. Idempotent. The
+   *  optional `reason` is recorded on the `session_closed` event. */
+  close(reason?: string): Promise<void>;
+  /** Release any consumers parked on `events.next()` by resolving them
+   *  with `done: true`. The events stream stays open; the next push and
+   *  next `.next()` proceed normally. Intended for consumers that
+   *  abandoned a `.next()` race (e.g. fire-timeout) and need to clear
+   *  the leaked waiter so subsequent events aren't lost. */
+  cancelEventWaiters(): void;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -462,10 +462,29 @@ export class DreamWorker {
   #running = false;
   #session_: AgentSession | null = null;
   #sessionReady: Promise<AgentSession> | null = null;
+  /** `#acceptingNew` flips false the moment `close()` is called: any
+   *  further `enqueue` calls are dropped on the floor (caller-facing
+   *  "we're shutting down"). `#closed` flips true only after the close
+   *  routine fully finishes — used to short-circuit a second close. */
+  #acceptingNew = true;
   #closed = false;
   /** Promise tracking the currently-active fire, so `close({awaitDrain})`
    *  can wait for it. Null between fires. */
   #activeFire: Promise<void> | null = null;
+  /** Payload id matched to `#activeFire`. Used to name the fire on a
+   *  fast-close `dropped` emit. Null between fires. */
+  #activePayloadId: string | null = null;
+  /** Promise tracking the running drain loop (one fire after another).
+   *  `close({ awaitDrain: true })` awaits this directly so queued fires
+   *  always finish before the worker tears down. Resolves to a fresh
+   *  resolved promise between drain cycles. */
+  #loopDone: Promise<void> = Promise.resolve();
+  /** Wall-clock grace given to an in-flight fire when `close({
+   *  awaitDrain: false })` is invoked. After this elapses, the active
+   *  fire is abandoned (its `finished` may still arrive on `dream.jsonl`
+   *  later, but the close path stops waiting). Kept small so a wedged
+   *  dreamer can't block the parent from exiting. */
+  static #FAST_CLOSE_GRACE_MS = 2_000;
 
   private constructor(args: {
     definition: DreamerDefinition;
@@ -544,7 +563,7 @@ export class DreamWorker {
   /** Apply this worker's backpressure policy and (when appropriate) push
    *  the payload onto the queue. Idempotent w.r.t. closed state. */
   enqueue(payload: DreamPayload): void {
-    if (this.#closed) return;
+    if (!this.#acceptingNew) return;
     const id = `${this.definition.name}#${this.#nextPayloadId++}`;
     this.#payloadIds.set(payload, id);
     applyBackpressure({
@@ -561,19 +580,27 @@ export class DreamWorker {
   }
 
   /** Spawn the consumption loop. Resolves the head, runs it, repeats
-   *  until the queue is empty. Re-entrant guard via `#running`. */
+   *  until the queue is empty. Re-entrant guard via `#running`.
+   *
+   *  Note: the loop does NOT short-circuit on `#closed` / `#acceptingNew`
+   *  — `close({ awaitDrain: true })` relies on the loop to keep draining
+   *  whatever was already enqueued before the close call. The fast-close
+   *  path (`awaitDrain: false`) instead empties `#queue` itself before
+   *  awaiting the loop, so the loop terminates naturally. */
   #drainLoop(): void {
     if (this.#running) return;
     this.#running = true;
-    const loop = (async () => {
+    this.#loopDone = (async () => {
       try {
-        while (this.#queue.length > 0 && !this.#closed) {
+        while (this.#queue.length > 0) {
           const next = this.#queue.shift()!;
+          this.#activePayloadId = this.#payloadIds.get(next) ?? "?";
           this.#activeFire = this.#runOne(next);
           try {
             await this.#activeFire;
           } finally {
             this.#activeFire = null;
+            this.#activePayloadId = null;
           }
         }
       } finally {
@@ -581,8 +608,8 @@ export class DreamWorker {
       }
     })();
     // Don't keep a hard reference — failures inside loop are surfaced via
-    // lifecycle events. Caller close() awaits activeFire separately.
-    loop.catch(() => {});
+    // lifecycle events. Caller close() awaits #loopDone explicitly.
+    this.#loopDone.catch(() => {});
   }
 
   async #runOne(payload: DreamPayload): Promise<void> {
@@ -641,6 +668,25 @@ export class DreamWorker {
         payloadId: id,
         reason: "fire_timeout",
       });
+      // Hard-cancel the wedged session. Abandoning `iter.next()` in
+      // `consumeTurn` leaves a resolve callback registered on the
+      // outbox's waiter list; even if we cancel it, the in-flight model
+      // call may still push a late `reply` / `abort` event afterward.
+      // Either way, a stale event would taint the next fire. Cheapest
+      // robust answer: tear the session down and lazily re-open on the
+      // next fire. (`cancelEventWaiters` is belt-and-braces — it
+      // releases the abandoned waiter immediately even if close hangs.)
+      try { session.cancelEventWaiters(); } catch { /* */ }
+      const dead = this.#session_;
+      this.#session_ = null;
+      this.#sessionReady = null;
+      if (dead) {
+        // Don't await close — the wedged session may not close cleanly
+        // (worker still waiting on a model call). Best-effort + orphan.
+        // Putting it in the void promise chain prevents an unhandled
+        // rejection if close throws.
+        dead.close("dreamer fire timeout").catch(() => {});
+      }
     }
   }
 
@@ -651,27 +697,69 @@ export class DreamWorker {
    *  in isolation.
    *
    *  The dreamer's own Agent will open its own SessionStore on the same
-   *  dir we already locked. Release our scout lock first. */
+   *  dir we already locked. Release our scout lock first.
+   *
+   *  IMPORTANT: `agent.openSession()` enqueues the standing `task` as a
+   *  `user_task` and starts processing immediately, so the model emits a
+   *  reply/abort/exhausted for the standing task on its own. If we
+   *  returned the session right away, the very first `#runOne` would
+   *  call `session.send(payload)` and `consumeTurn` would consume the
+   *  standing-task terminal — mis-attributing it as the payload's
+   *  result and silently dropping the payload's actual terminal into the
+   *  outbox for the next fire to misread. We drain that standing-task
+   *  terminal here so the first real fire starts from a clean slate. */
   async #ensureAgentSession(): Promise<AgentSession> {
     if (this.#session_) return this.#session_;
     if (this.#sessionReady) return await this.#sessionReady;
     this.#sessionReady = (async () => {
       // Hand the directory over to the Agent's own SessionStore.
       await this.#session.close();
-      this.#session_ = await this.#agent.openSession();
-      return this.#session_;
+      const s = await this.#agent.openSession();
+      // Silently drain the standing-task terminal. If the drain itself
+      // times out (model wedged), `consumeTurn` reports `timedOut: true`;
+      // tear the session down so the next fire opens a fresh one.
+      const drain = await consumeTurn(
+        s,
+        this.definition.fireTimeoutMs ?? 5 * 60_000,
+      );
+      if (drain.timedOut) {
+        try { s.cancelEventWaiters(); } catch { /* */ }
+        s.close("dreamer standing-task drain timeout").catch(() => {});
+        throw new Error("dreamer standing task did not terminate within fireTimeoutMs");
+      }
+      this.#session_ = s;
+      return s;
     })();
-    return await this.#sessionReady;
+    try {
+      return await this.#sessionReady;
+    } catch (e) {
+      // Reset the cache so the next fire can retry. The caller (`#runOne`)
+      // emits a `finished` with the error.
+      this.#sessionReady = null;
+      throw e;
+    }
   }
 
-  /** Cooperative shutdown. When `awaitDrain` is true, finishes in-flight
-   *  + queued fires; otherwise drops the queue (one `dropped` event per)
-   *  and waits only for any currently-running fire. */
+  /** Cooperative shutdown.
+   *
+   *  - `awaitDrain: true`:  stop accepting new fires, then wait for the
+   *    drain loop to finish every payload that was already queued. The
+   *    contract `awaitDreamsOnClose: true` promises to callers.
+   *  - `awaitDrain: false`: stop accepting new fires, drop the queue
+   *    (one `dropped` event per), and race the active fire against a
+   *    short grace (`#FAST_CLOSE_GRACE_MS`). If the grace elapses, the
+   *    active fire is abandoned — its `finished` may still land on
+   *    `dream.jsonl` asynchronously, but the parent stops waiting. */
   async close(opts: { awaitDrain: boolean }): Promise<void> {
     if (this.#closed) return;
-    this.#closed = true;
+    this.#acceptingNew = false;
 
-    if (!opts.awaitDrain) {
+    if (opts.awaitDrain) {
+      // Let the loop pull everything that's already queued. The loop
+      // body doesn't observe `#acceptingNew` / `#closed`, so a fire we
+      // enqueued before this close call still runs to completion.
+      try { await this.#loopDone; } catch { /* */ }
+    } else {
       // Drop everything that hasn't started yet.
       const dropped = this.#queue.splice(0, this.#queue.length);
       for (const p of dropped) {
@@ -682,16 +770,46 @@ export class DreamWorker {
           reason: "cancelled_on_parent_close",
         });
       }
+      // Race the active fire against a short grace. A wedged dreamer
+      // (slow model, hanging tool) must not block the parent from
+      // exiting just because the parent set `awaitDreamsOnClose: false`.
+      if (this.#activeFire) {
+        const grace = DreamWorker.#FAST_CLOSE_GRACE_MS;
+        const timedOut = await Promise.race([
+          this.#activeFire.then(() => false, () => false),
+          new Promise<true>((res) => setTimeout(() => res(true), grace)),
+        ]);
+        if (timedOut) {
+          // Emit a `dropped` for the abandoned fire so observers see the
+          // outcome. The `started` event is already on disk; the
+          // matching `finished` will only land if the fire eventually
+          // completes (and the writer is still open at that point).
+          // Find the in-flight payload id by sniffing the loop state —
+          // we don't track it directly, so emit a generic marker.
+          this.#emit({
+            kind: "dropped",
+            dreamer: this.definition.name,
+            payloadId: this.#activePayloadId ?? "?",
+            reason: "cancelled_on_parent_close",
+          });
+        }
+      }
     }
-    // Either way, wait for the currently-running fire (if any) so we
-    // don't leak the dreamer's sandbox process.
-    if (this.#activeFire) {
-      try { await this.#activeFire; } catch { /* */ }
-    }
-    // With awaitDrain, the loop above already pulled everything; the
-    // queue is empty here. Without it, we may have dropped queued items.
+    this.#closed = true;
     if (this.#session_) {
-      try { await this.#session_.close(); } catch { /* */ }
+      if (opts.awaitDrain) {
+        // Healthy path — every queued fire already finished, so the
+        // session should close promptly.
+        try { await this.#session_.close(); } catch { /* */ }
+      } else {
+        // Fast-close path. A wedged dreamer's model call blocks the
+        // session's worker, which in turn blocks `session.close()`
+        // (close awaits worker exit before killing the sandbox).
+        // Fire-and-forget so the parent isn't held hostage. The
+        // sandbox has its own kill timeout, and the .lock file on
+        // disk releases when the process exits.
+        this.#session_.close().catch(() => {});
+      }
     } else {
       // We opened the scout SessionStore but never handed off to the
       // Agent. Release the scout lock so the workspace is reusable.

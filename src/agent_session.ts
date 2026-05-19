@@ -304,6 +304,16 @@ export class AgentSessionImpl implements AgentSession {
     return impl;
   }
 
+  /** Cancel any consumers currently parked on `events.next()` by
+   *  resolving them with `done: true`. The events stream stays open;
+   *  subsequent pushes/nexts proceed normally. Intended for consumers
+   *  that abandoned a `.next()` race (e.g. fire-timeout in the dreamer
+   *  worker) and need to release the leaked waiter so the next consumer
+   *  doesn't lose the next emitted event. */
+  cancelEventWaiters(): void {
+    this.#outbox.cancelPendingWaiters();
+  }
+
   send(msg: UserMessage): void {
     if (this.#closed) return;
     if (!msg || msg.kind !== "user_message" || typeof msg.content !== "string") {
@@ -1071,6 +1081,20 @@ export class AsyncQueueInternal<T> implements AsyncIterable<T> {
       while (this.#waiters.length > 0) {
         this.#waiters.shift()!({ value: undefined, done: true });
       }
+    }
+  }
+
+  /** Resolve every currently-pending waiter with `done: true` without
+   *  closing the queue. New pushes/nexts behave normally afterward.
+   *
+   *  This is the escape hatch for race-with-timeout consumers that
+   *  abandon `.next()` on overrun. Without it, the abandoned resolve
+   *  remains in `#waiters` and the next push hands the event to a
+   *  consumer that no one is awaiting — silently losing the event for
+   *  the next live caller. */
+  cancelPendingWaiters(): void {
+    while (this.#waiters.length > 0) {
+      this.#waiters.shift()!({ value: undefined as unknown as T, done: true });
     }
   }
 
