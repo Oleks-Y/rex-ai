@@ -80,3 +80,5 @@ export {
 } from "./types.ts";
 export { blobRelPath, IORecorder } from "./io_record.ts";
 export type { IORecorderOpts } from "./io_record.ts";
+export { serveChat, UnauthorizedError } from "./web/server.ts";
+export type { BuildAgentInput, ServeChatOptions } from "./web/server.ts";

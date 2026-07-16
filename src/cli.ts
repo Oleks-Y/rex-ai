@@ -523,7 +523,7 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 export class StatusLine {
   readonly #enabled: boolean;
   #frame = 0;
-  #timer: number | null = null;
+  #timer: ReturnType<typeof setInterval> | null = null;
   #current: string | null = null;
   #shown = "";
 

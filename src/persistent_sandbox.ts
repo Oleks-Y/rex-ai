@@ -131,7 +131,7 @@ export class PersistentSandbox {
   readonly #wakeupHandlers: WakeupHandlers;
   readonly #wakeupMirror: Map<string, WakeupDescriptor> = new Map();
   readonly #autoWakeOnTimer: boolean;
-  #gcTimer: number | null = null;
+  #gcTimer: ReturnType<typeof setInterval> | null = null;
 
   #proc: Deno.ChildProcess | null = null;
   #reader: FrameReader | null = null;
@@ -521,7 +521,7 @@ export class PersistentSandbox {
     const baseDeadline = stepStart + stepTimeoutMs;
     const activePromises = new Map<string, number>();
     let currentDeadline = baseDeadline;
-    let timeoutHandle: number | null = null;
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
 
     const fireDeadline = () => {
       const elapsed = currentDeadline - stepStart;
@@ -619,7 +619,7 @@ export class PersistentSandbox {
     const proc = this.#proc;
     if (proc) {
       const status = proc.status.catch(() => null);
-      let timerHandle: number | null = null;
+      let timerHandle: ReturnType<typeof setTimeout> | null = null;
       const timer = new Promise<"timeout">((resolve) => {
         timerHandle = setTimeout(() => resolve("timeout"), 2000);
       });
